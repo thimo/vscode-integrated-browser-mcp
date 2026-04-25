@@ -110,7 +110,7 @@ All interaction tools accept an optional `tabId` parameter. Omit it to target th
 | `browser_scroll` | Scroll the page or a specific element |
 | `browser_screenshot` | Take a screenshot (returns image). Supports `fullPage` for whole-document capture and `waitMs` for post-transition timing. |
 | `browser_screenshot_slice` | Capture one viewport-height slice of a long page plus metadata. For AI navigation of pages that exceed Chromium's single-PNG axis cap. Pair with `browser_emulate` to set the viewport first. |
-| `browser_markdown` | Extract page content as markdown (lightweight pure-JS DOM walker — no Readability/Turndown). Useful for reading documentation pages without dumping the entire DOM. |
+| `browser_markdown` | Extract page content as markdown (lightweight pure-JS DOM walker — no Readability/Turndown). Useful for reading documentation pages without dumping the entire DOM. Pass `outputPath` (absolute) to write the markdown to disk and return only a byte-count confirmation — keeps content out of the agent's context for bulk archival. |
 | `browser_snapshot` | Get the accessibility tree |
 | `browser_emulate` | Override viewport dimensions, DPR, mobile flag, and User-Agent. Sticky until `reset:true`. |
 | `browser_dom` | Get the full page HTML |

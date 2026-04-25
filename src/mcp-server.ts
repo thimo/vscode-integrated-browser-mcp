@@ -275,17 +275,36 @@ server.tool(
 // Markdown
 server.tool(
 	'browser_markdown',
-	'Extract page content as markdown. Walks the DOM in-page (~80 lines of pure JS, no Readability/Turndown, no deps). Headings → `#`, links → `[text](url)`, code → backticks, pre → fenced blocks, lists → `-` / `1.`, blockquotes → `>`, images → `![alt](src)`. By default scopes to `<main>` if present, else `<body>`; pass `selector` to scope elsewhere. Useful for letting an agent read a doc page without dumping the entire DOM (browser_dom is much heavier). Lightweight extractor, not Turndown — output may include layout artifacts on heavily designed sites; for those use browser_dom + your own post-processing.',
+	'Extract page content as markdown. Walks the DOM in-page (~80 lines of pure JS, no Readability/Turndown, no deps). Headings → `#`, links → `[text](url)`, code → backticks, pre → fenced blocks, lists → `-` / `1.`, blockquotes → `>`, images → `![alt](src)`. By default scopes to `<main>` if present, else `<body>`; pass `selector` to scope elsewhere. Useful for letting an agent read a doc page without dumping the entire DOM (browser_dom is much heavier). Lightweight extractor, not Turndown — output may include layout artifacts on heavily designed sites; for those use browser_dom + your own post-processing. Pass `outputPath` (absolute) to write the markdown to disk and return only `Saved N bytes to <path>` — useful for bulk archival where the body would otherwise flow through the agent\'s context.',
 	{
 		selector: z.string().optional().describe('CSS selector to scope extraction to (e.g. "article", "#content"). Default: "main" if present, else body.'),
+		outputPath: z.string().optional().describe('Absolute path to write the markdown to. Parent directories are created if missing; existing files are overwritten. When set, the tool returns a short "Saved N bytes to <path>" confirmation instead of the markdown body — keeps the content out of the agent\'s context for archival jobs.'),
 		tabId: z.string().optional().describe(tabIdDescription),
 	},
-	async ({ selector, tabId }) => {
+	async ({ selector, outputPath, tabId }) => {
 		const params = new URLSearchParams();
 		if (selector) params.set('selector', selector);
 		if (tabId) params.set('tabId', tabId);
 		const qs = params.toString() ? `?${params}` : '';
-		return toMcpResult(await bridgeFetch(`/markdown${qs}`));
+		const result = await bridgeFetch(`/markdown${qs}`);
+		if (!result.ok) {
+			return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
+		}
+		if (outputPath !== undefined) {
+			if (!path.isAbsolute(outputPath)) {
+				return { content: [{ type: 'text' as const, text: `Error: outputPath must be absolute (got "${outputPath}")` }], isError: true };
+			}
+			const body = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+			try {
+				await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+				await fs.promises.writeFile(outputPath, body, 'utf8');
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return { content: [{ type: 'text' as const, text: `Error: failed to write ${outputPath}: ${message}` }], isError: true };
+			}
+			return { content: [{ type: 'text' as const, text: `Saved ${Buffer.byteLength(body, 'utf8')} bytes to ${outputPath}` }] };
+		}
+		return toMcpResult(result);
 	},
 );
 
