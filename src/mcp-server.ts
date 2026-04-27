@@ -133,7 +133,7 @@ The bridge lazy-launches the browser on the first interaction, so the very first
 
 const server = new McpServer({
 	name: 'integrated-browser-mcp',
-	version: '0.4.1',
+	version: '0.5.0',
 }, {
 	instructions: SERVER_INSTRUCTIONS,
 });
