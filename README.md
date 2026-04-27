@@ -1,5 +1,7 @@
 # Integrated Browser MCP
 
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/thimo.integrated-browser-mcp?label=marketplace)](https://marketplace.visualstudio.com/items?itemName=thimo.integrated-browser-mcp)
+
 Exposes VS Code's integrated browser to external agents (Claude Code, scripts, curl) via a local HTTP API and MCP server.
 
 Every existing browser automation solution targets an external Chrome process. This extension is different: it bridges the browser **already inside VS Code** — with your session cookies, your localhost dev server, your DevTools — to any agent that can speak HTTP or MCP.
@@ -19,7 +21,10 @@ The extension uses VS Code's built-in `editor-browser` and the Chrome DevTools P
 
 ## Getting started
 
-1. Install the extension
+1. Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=thimo.integrated-browser-mcp), or run:
+   ```bash
+   code --install-extension thimo.integrated-browser-mcp
+   ```
 2. The HTTP server starts automatically on `localhost:3788`
 3. For Claude Code: the MCP server is auto-configured in `~/.claude.json` on first activation
 4. The browser launches lazily on the first request — no browser tab until you need one
