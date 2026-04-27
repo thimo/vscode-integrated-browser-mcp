@@ -266,8 +266,8 @@ export class BridgeServer {
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
 				const fullPage = req.query.fullPage === 'true';
-				const waitMs = Number(req.query.waitMs);
-				if (Number.isFinite(waitMs) && waitMs > 0) {
+				const waitMs = Math.min(10000, Math.max(0, Number(req.query.waitMs) || 0));
+				if (waitMs > 0) {
 					await new Promise(resolve => setTimeout(resolve, waitMs));
 				}
 				const result = await resolved.tab.send('Page.captureScreenshot', {
