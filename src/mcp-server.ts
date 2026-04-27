@@ -23,7 +23,7 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-function discoverPort(): number | null {
+function discoverInstance(): Instance | null {
 	const cwd = process.cwd();
 	try {
 		const files = fs.readdirSync(INSTANCES_DIR).filter(f => f.endsWith('.json'));
@@ -46,19 +46,23 @@ function discoverPort(): number | null {
 			if (!inst.workspace) continue;
 			// Ensure match is on a path boundary (exact match or followed by separator)
 			if (cwd === inst.workspace || cwd.startsWith(inst.workspace + path.sep)) {
-				return inst.port;
+				return inst;
 			}
 		}
 
 		// Fallback: return the most recently started instance
 		instances.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
 		if (instances.length > 0) {
-			return instances[0].port;
+			return instances[0];
 		}
 	} catch {
 		// instances dir doesn't exist yet
 	}
 	return null;
+}
+
+function discoverPort(): number | null {
+	return discoverInstance()?.port ?? null;
 }
 
 function getBridgeUrl(): string {
@@ -197,10 +201,18 @@ server.tool(
 // Screenshot
 server.tool(
 	'browser_screenshot',
-	'Capture the page as a PNG (returned as an image). Heavy — use only when visual verification matters. For reading data, browser_eval or browser_snapshot is faster.',
-	{ tabId: z.string().optional().describe(tabIdDescription) },
-	async ({ tabId }) => {
-		const qs = tabId ? `?tabId=${encodeURIComponent(tabId)}` : '';
+	'Capture the page as a PNG (returned as an image). Heavy — use only when visual verification matters. For reading data, browser_eval or browser_snapshot is faster. Pass fullPage:true to capture the whole scrollable page (useful for tall single-page sites or layout audits); default is viewport-only. Pass waitMs to sleep before the capture when the page has running CSS transitions (theme flips, view swaps) — 400–600ms covers most Tailwind transition-colors durations.',
+	{
+		fullPage: z.boolean().optional().describe('Capture the entire scrollable page instead of just the viewport. Default false.'),
+		waitMs: z.number().int().min(0).max(10000).optional().describe('Sleep this many milliseconds before capturing. Use when the page has running CSS transitions — className changes are synchronous but paint lags by the transition duration. Default 0.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ fullPage, waitMs, tabId }) => {
+		const params = new URLSearchParams();
+		if (fullPage) params.set('fullPage', 'true');
+		if (waitMs) params.set('waitMs', String(waitMs));
+		if (tabId) params.set('tabId', tabId);
+		const qs = params.toString() ? `?${params}` : '';
 		const result = await bridgeFetch(`/screenshot${qs}`);
 		if (!result.ok) {
 			return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
@@ -212,6 +224,104 @@ server.tool(
 				mimeType: 'image/png',
 			}],
 		};
+	},
+);
+
+// Emulate
+server.tool(
+	'browser_emulate',
+	'Override device metrics (width, height, deviceScaleFactor, mobile, optional userAgent) on the target tab. Setting `mobile:true` also enables touch emulation so `(hover:none)` / `(pointer:coarse)` media queries fire — without that, mobile sites render their desktop fallback even at iPhone dimensions. The override persists on the tab until cleared with `{reset:true}` — call reset before tests that should see the natural viewport, otherwise prior emulation will leak.',
+	{
+		width: z.number().int().positive().optional().describe('Viewport width in CSS pixels. Required unless reset is true.'),
+		height: z.number().int().positive().optional().describe('Viewport height in CSS pixels. Required unless reset is true.'),
+		deviceScaleFactor: z.number().positive().optional().describe('Device pixel ratio (e.g. 2 for Retina, 3 for iPhone Pro). Default 1.'),
+		mobile: z.boolean().optional().describe('Emulate a mobile device (enables touch + mobile media queries). Default false.'),
+		userAgent: z.string().optional().describe('Override the User-Agent string. Recommended when emulating mobile so server-side UA sniffing matches.'),
+		reset: z.boolean().optional().describe('Clear all emulation overrides on this tab. Pass alone — other fields are ignored.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ width, height, deviceScaleFactor, mobile, userAgent, reset, tabId }) => {
+		return toMcpResult(await bridgePost('/emulate', { width, height, deviceScaleFactor, mobile, userAgent, reset, tabId }));
+	},
+);
+
+// Screenshot slice
+server.tool(
+	'browser_screenshot_slice',
+	'Capture one viewport-height slice of a long page, plus page metadata. Designed for AI consumers of tall pages where a single full-page PNG either fails (Chromium caps single-image axes at ~16384 px) or compresses to an unreadable thumbnail. Call with no `slice` first to learn the shape (returns `totalSlices`, `scrollHeight`, `viewportHeight`, no image), then request specific slices by index. `slice: 0` is the top (header), `slice: -1` is the last slice (footer); negative indices count from the end. Out-of-range indices clamp. Pair with `browser_emulate` first to anchor the viewport at a real desktop/mobile size — slicing the editor pane\'s natural width gives meaningless results. Note: this tool scrolls the target tab — use `browser_scroll` to restore if needed.',
+	{
+		slice: z.number().int().optional().describe('0-indexed slice to capture. Negative counts from the end (-1 = last, -2 = second-to-last). Omit to get metadata only.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ slice, tabId }) => {
+		const params = new URLSearchParams();
+		if (typeof slice === 'number') params.set('slice', String(slice));
+		if (tabId) params.set('tabId', tabId);
+		const qs = params.toString() ? `?${params}` : '';
+		const result = await bridgeFetch(`/screenshot-slice${qs}`);
+		if (!result.ok) {
+			return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
+		}
+		const data = result.data as { totalSlices: number; scrollHeight: number; viewportHeight: number; slice: number | null; image?: string };
+		const summary = data.slice === null
+			? `Page has ${data.totalSlices} slice(s) — scrollHeight ${data.scrollHeight}px, viewport ${data.viewportHeight}px. Pass slice:0 for the top, slice:-1 for the footer.`
+			: `Slice ${data.slice} of ${data.totalSlices} (y=${data.slice * data.viewportHeight}–${Math.min((data.slice + 1) * data.viewportHeight, data.scrollHeight)}px of ${data.scrollHeight}px total).`;
+		const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [
+			{ type: 'text' as const, text: summary },
+		];
+		if (data.image) {
+			content.push({ type: 'image' as const, data: data.image, mimeType: 'image/png' });
+		}
+		return { content };
+	},
+);
+
+// Markdown
+server.tool(
+	'browser_markdown',
+	'Extract page content as markdown. Walks the DOM in-page (~80 lines of pure JS, no Readability/Turndown, no deps). Headings → `#`, links → `[text](url)`, code → backticks, pre → fenced blocks, lists → `-` / `1.`, blockquotes → `>`, images → `![alt](src)`. By default scopes to `<main>` if present, else `<body>`; pass `selector` to scope elsewhere. Useful for letting an agent read a doc page without dumping the entire DOM (browser_dom is much heavier). Lightweight extractor, not Turndown — output may include layout artifacts on heavily designed sites; for those use browser_dom + your own post-processing. Pass `outputPath` to write the markdown to disk and return only `Saved N bytes to <path>` — the path is scoped to the open workspace folder (relative paths resolve against it; absolute paths must live inside it). Useful for bulk archival where the body would otherwise flow through the agent\'s context.',
+	{
+		selector: z.string().optional().describe('CSS selector to scope extraction to (e.g. "article", "#content"). Default: "main" if present, else body.'),
+		outputPath: z.string().optional().describe('Path (absolute or workspace-relative) to write the markdown to. Resolved against the open workspace folder; the resolved path must live inside it. Parent directories are created if missing; existing files are overwritten. When set, the tool returns a short "Saved N bytes to <path>" confirmation instead of the markdown body — keeps the content out of the agent\'s context for archival jobs. Symlinks inside the workspace that escape it are not followed; don\'t enable in workspaces with hostile symlinks.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ selector, outputPath, tabId }) => {
+		const params = new URLSearchParams();
+		if (selector) params.set('selector', selector);
+		if (tabId) params.set('tabId', tabId);
+		const qs = params.toString() ? `?${params}` : '';
+		const result = await bridgeFetch(`/markdown${qs}`);
+		if (!result.ok) {
+			return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
+		}
+		if (outputPath !== undefined) {
+			// Scope outputPath to the bound workspace folder. Relative paths
+			// resolve against the workspace; absolute paths must live inside
+			// it. Symlinks are not followed — `fs.realpath` per write would
+			// add cost for a low-probability case in a workspace the user
+			// controls; documented above instead.
+			const instance = discoverInstance();
+			if (!instance?.workspace) {
+				return { content: [{ type: 'text' as const, text: `Error: outputPath requires an open workspace folder` }], isError: true };
+			}
+			const workspace = instance.workspace;
+			const resolved = path.isAbsolute(outputPath)
+				? path.resolve(outputPath)
+				: path.resolve(workspace, outputPath);
+			if (resolved !== workspace && !resolved.startsWith(workspace + path.sep)) {
+				return { content: [{ type: 'text' as const, text: `Error: outputPath must be inside the workspace (${workspace}); got ${resolved}` }], isError: true };
+			}
+			const body = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+			try {
+				await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
+				await fs.promises.writeFile(resolved, body, 'utf8');
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return { content: [{ type: 'text' as const, text: `Error: failed to write ${resolved}: ${message}` }], isError: true };
+			}
+			return { content: [{ type: 'text' as const, text: `Saved ${Buffer.byteLength(body, 'utf8')} bytes to ${resolved}` }] };
+		}
+		return toMcpResult(result);
 	},
 );
 

@@ -108,8 +108,11 @@ All interaction tools accept an optional `tabId` parameter. Omit it to target th
 | `browser_click` | Click an element by CSS selector |
 | `browser_type` | Type text into an element by CSS selector |
 | `browser_scroll` | Scroll the page or a specific element |
-| `browser_screenshot` | Take a screenshot (returns image) |
+| `browser_screenshot` | Take a screenshot (returns image). Supports `fullPage` for whole-document capture and `waitMs` for post-transition timing. |
+| `browser_screenshot_slice` | Capture one viewport-height slice of a long page plus metadata. For AI navigation of pages that exceed Chromium's single-PNG axis cap. Pair with `browser_emulate` to set the viewport first. |
+| `browser_markdown` | Extract page content as markdown (lightweight pure-JS DOM walker — no Readability/Turndown). Useful for reading documentation pages without dumping the entire DOM. Pass `outputPath` to write the markdown to disk and return only a byte-count confirmation — scoped to the open workspace folder (relative paths resolve against it; absolute paths must live inside it), keeps content out of the agent's context for bulk archival. |
 | `browser_snapshot` | Get the accessibility tree |
+| `browser_emulate` | Override viewport dimensions, DPR, mobile flag, and User-Agent. Sticky until `reset:true`. |
 | `browser_dom` | Get the full page HTML |
 | `browser_console` | Read buffered console output (aggregates across tabs when `tabId` omitted) |
 | `browser_network` | Read buffered network requests (aggregates across tabs when `tabId` omitted) |
@@ -137,7 +140,10 @@ All interaction endpoints (navigate, eval, click, type, scroll, screenshot, snap
 | POST | `/click` | `{ selector, tabId? }` | Click element by CSS selector |
 | POST | `/type` | `{ selector, text, tabId? }` | Type into element |
 | POST | `/scroll` | `{ deltaX, deltaY, selector?, tabId? }` | Scroll page or element |
-| GET | `/screenshot` | `?tabId=X` | Base64 PNG screenshot |
+| GET | `/screenshot` | `?tabId=X&fullPage=true&waitMs=N` | Base64 PNG screenshot. `fullPage=true` captures beyond the viewport. `waitMs` sleeps before capture (handles CSS transitions). |
+| GET | `/screenshot-slice` | `?slice=N&tabId=X` | Viewport-height slice plus metadata. `slice` is 0-indexed; negative from end. Omit `slice` for metadata only. |
+| GET | `/markdown` | `?selector=S&tabId=X` | Page content as markdown. `selector` defaults to `main` (falls back to `body`). |
+| POST | `/emulate` | `{ width, height, deviceScaleFactor?, mobile?, userAgent?, reset?, tabId? }` | Device-metric override. `{reset:true}` clears. |
 | GET | `/snapshot` | `?tabId=X` | Accessibility tree |
 | GET | `/dom` | `?tabId=X` | Full page outerHTML |
 | GET | `/console` | `?limit=N&tabId=X` | Buffered console output (last 200). Aggregates across tabs when `tabId` omitted. |
