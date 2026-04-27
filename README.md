@@ -1,6 +1,6 @@
 # Integrated Browser MCP
 
-[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/thimo.integrated-browser-mcp?label=marketplace)](https://marketplace.visualstudio.com/items?itemName=thimo.integrated-browser-mcp)
+[![Release](https://img.shields.io/github/v/release/thimo/integrated-browser-mcp?label=release)](https://github.com/thimo/integrated-browser-mcp/releases) [![VS Code Marketplace](https://img.shields.io/badge/marketplace-install-blue)](https://marketplace.visualstudio.com/items?itemName=thimo.integrated-browser-mcp)
 
 Exposes VS Code's integrated browser to external agents (Claude Code, scripts, curl) via a local HTTP API and MCP server.
 
