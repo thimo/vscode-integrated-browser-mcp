@@ -367,14 +367,27 @@ export class BridgeServer {
 				if (slice < 0) slice = totalSlices + slice;
 				slice = Math.max(0, Math.min(totalSlices - 1, slice));
 
-				const targetY = slice * viewportHeight;
-				await resolved.tab.send('Runtime.evaluate', {
-					expression: `window.scrollTo(0, ${targetY}); new Promise(r => setTimeout(r, 200))`,
+				const prev = await resolved.tab.send('Runtime.evaluate', {
+					expression: '({x: window.scrollX, y: window.scrollY})',
 					returnByValue: true,
-					awaitPromise: true,
-				});
-				const shot = await resolved.tab.send('Page.captureScreenshot', { format: 'png' }) as { data: string };
-				res.json({ ok: true, data: { totalSlices, scrollHeight, viewportHeight, slice, image: shot.data } });
+				}) as { result: { value: { x: number; y: number } } };
+				const { x: prevX, y: prevY } = prev.result.value;
+
+				const targetY = slice * viewportHeight;
+				try {
+					await resolved.tab.send('Runtime.evaluate', {
+						expression: `window.scrollTo(0, ${targetY}); new Promise(r => setTimeout(r, 200))`,
+						returnByValue: true,
+						awaitPromise: true,
+					});
+					const shot = await resolved.tab.send('Page.captureScreenshot', { format: 'png' }) as { data: string };
+					res.json({ ok: true, data: { totalSlices, scrollHeight, viewportHeight, slice, image: shot.data } });
+				} finally {
+					await resolved.tab.send('Runtime.evaluate', {
+						expression: `window.scrollTo(${prevX}, ${prevY})`,
+						returnByValue: true,
+					}).catch(() => {});
+				}
 			} catch (err) {
 				res.json({ ok: false, error: String(err) });
 			}
