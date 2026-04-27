@@ -89,9 +89,13 @@ if [[ "$current_branch" != "main" ]]; then
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
-	echo "Working tree must be clean. git status:" >&2
-	git status --short >&2
-	exit 1
+	if $DRY_RUN; then
+		echo "(dry-run: ignoring dirty tree)"
+	else
+		echo "Working tree must be clean. git status:" >&2
+		git status --short >&2
+		exit 1
+	fi
 fi
 
 current_version=$(node -p "require('./package.json').version")
@@ -231,10 +235,11 @@ echo "==> Creating GitHub release"
 notes=$(mktemp)
 trap 'rm -f "$notes"' EXIT
 
-# Extract the just-released CHANGELOG section as the release body. Python over
-# awk because awk's regex needs the dots in the version escaped, and the
-# bash-quoting-into-awk dance gets ugly fast.
-python3 - "$VERSION" "$notes" <<'PY'
+if ! $DRY_RUN; then
+	# Extract the just-released CHANGELOG section as the release body.
+	# Python over awk because awk's regex needs the version's dots escaped
+	# and the bash-quoting-into-awk dance gets ugly fast.
+	python3 - "$VERSION" "$notes" <<'PY'
 import re, sys
 version, notes_path = sys.argv[1], sys.argv[2]
 with open('CHANGELOG.md') as f:
@@ -247,6 +252,7 @@ if not body:
 with open(notes_path, 'w') as f:
     f.write(body + '\n')
 PY
+fi
 
 run gh release create "v$VERSION" "$VSIX" \
 	--title "v$VERSION" \
