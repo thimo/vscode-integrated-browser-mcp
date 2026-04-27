@@ -5,6 +5,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
+// Replaced at build time by esbuild's `define` (see esbuild.js). Keeps
+// package.json as the single source of truth for the version string.
+declare const __PKG_VERSION__: string;
+
 const INSTANCES_DIR = path.join(os.homedir(), '.integrated-browser-mcp', 'instances');
 
 interface Instance {
@@ -133,7 +137,7 @@ The bridge lazy-launches the browser on the first interaction, so the very first
 
 const server = new McpServer({
 	name: 'integrated-browser-mcp',
-	version: '0.5.0',
+	version: __PKG_VERSION__,
 }, {
 	instructions: SERVER_INSTRUCTIONS,
 });
