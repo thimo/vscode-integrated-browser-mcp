@@ -43,7 +43,7 @@ const { host, port } = await session.customRequest('requestCDPProxy');
 ```
 The `editor-browser` debug type became first-class in VS Code 1.112 (vscode-js-debug PR #2329). It gives raw WebSocket CDP — navigate, eval, screenshot, click, DOM, network interception, everything.
 
-On VS Code 1.117+ (vscode PR #311049), the CDP proxy multiplexes sessions for iframes / web workers / service workers via `Target.setAutoAttach({ flatten: true })`. Messages carry a top-level `sessionId` field; our `CDPConnection.send()` accepts an optional `sessionId` to route commands to specific targets.
+On VS Code 1.118+ (vscode PR #311049), the CDP proxy multiplexes sessions for iframes / web workers / service workers via `Target.setAutoAttach({ flatten: true })`. Messages carry a top-level `sessionId` field; our `CDPConnection.send()` accepts an optional `sessionId` to route commands to specific targets.
 
 ### Auto-attach flow
 The extension must:
