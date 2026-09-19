@@ -1085,6 +1085,12 @@ export class CDPTab {
 		if (!sessionId || !targetInfo) return;
 		// Skip our own handshake sessions — they aren't children to tag.
 		if (sessionId === this._pageSessionId || sessionId === this._browserSessionId) return;
+		// VS Code 1.135+ (vscode PR #331085): root-level setAutoAttach also attaches
+		// targets that already exist, so we get a second session on our own page.
+		// Enabling domains on it would duplicate every console/network entry. Left
+		// attached but idle — detaching is unsafe here because our own page
+		// session's event can race ahead of the `_pageSessionId` assignment.
+		if (this._pageTargetId && targetInfo.targetId === this._pageTargetId) return;
 		this.childSessions.set(sessionId, {
 			type: targetInfo.type,
 			url: targetInfo.url,
