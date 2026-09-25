@@ -8,6 +8,7 @@ import type * as vscode from 'vscode';
 import { hasProposedBrowserApi, openBrowserTabCount } from './cdp';
 import { allowsAllExistingTabs, enforceTabAccess as runEnforceTabAccess } from './sharing';
 import { decodePng, pixelAt } from './png';
+import { leaseBusyError } from './clients';
 
 const DOWNLOAD_BEHAVIORS: ReadonlySet<DownloadBehavior> = new Set(['allow', 'allowAndName', 'deny', 'default']);
 
@@ -143,7 +144,7 @@ export class BridgeServer {
 	private server: http.Server | null = null;
 	private cdp: CDPManager;
 	private log: vscode.OutputChannel;
-	private ensureBrowser: ((url?: string) => Promise<void>) | null = null;
+	private ensureBrowser: ((url?: string, clientId?: string) => Promise<void>) | null = null;
 	private emulatePath: 'emulation' | 'page' | 'unknown' = 'unknown';
 	/** Set when listening on a unix socket / named pipe instead of a TCP port. */
 	private socketPath: string | null = null;
@@ -159,8 +160,21 @@ export class BridgeServer {
 		this.setupRoutes();
 	}
 
-	setEnsureBrowser(fn: (url?: string) => Promise<void>): void {
+	setEnsureBrowser(fn: (url?: string, clientId?: string) => Promise<void>): void {
 		this.ensureBrowser = fn;
+	}
+
+	/**
+	 * The `X-Bridge-Client` header a session's mcp-server.ts process sends on
+	 * every request — its own random id, generated once at startup. Absent
+	 * for curl, an older MCP build, or the VS Code language-model tools:
+	 * those are "legacy" and keep today's global-pointer behaviour untouched
+	 * (see `clients.ts`).
+	 */
+	private clientIdFor(req: express.Request): string | undefined {
+		const header = req.get('X-Bridge-Client');
+		const trimmed = header?.trim();
+		return trimmed ? trimmed : undefined;
 	}
 
 	/**
@@ -178,7 +192,7 @@ export class BridgeServer {
 				await this.enforceTabAccess().catch(() => undefined);
 				if (this.cdp.tabCount === 0 && this.ensureBrowser) {
 					this.log.appendLine('[HTTP] No tabs, launching browser...');
-					await this.ensureBrowser(lazyUrl?.(req));
+					await this.ensureBrowser(lazyUrl?.(req), this.clientIdFor(req));
 				}
 				if (this.cdp.state !== 'connected') {
 					res.json({ ok: false, error: 'CDP not connected' });
@@ -305,48 +319,91 @@ export class BridgeServer {
 	}
 
 	/**
-	 * Middleware for endpoints that can move the page: records that an agent is
-	 * working in the target tab, which is what numbers and marks it. Chained
-	 * after the tab guards, so the tab is known to exist and be permitted.
-	 * Deliberately not applied to reads — looking at a page is not working in
-	 * it, and a marker that appears from a screenshot would be noise.
+	 * Claim the right to drive `tab` for `clientId`: on the single-tab
+	 * fallback path, refuses when another client's lease is live (isolation
+	 * is impossible with one tab, so it is locked instead — see
+	 * `clients.ts`); otherwise — or once claimed — assigns ownership (first
+	 * header-bearing client to touch an unowned tab wins it) and records
+	 * agent control (numbering/marking). Shared by every controlling route:
+	 * middleware for most, called directly by `/navigate`, which special-cases
+	 * its own tab resolution.
+	 */
+	private async claimControl(tab: CDPTab, clientId: string | undefined): Promise<{ ok: true } | { ok: false; error: string }> {
+		if (clientId && !hasProposedBrowserApi()) {
+			const claim = this.cdp.clients.claimLease(clientId);
+			if (!claim.ok) return { ok: false, error: leaseBusyError(claim.since) };
+		}
+		this.cdp.claimTabForClient(tab, clientId);
+		await this.cdp.noteAgentControl(tab).catch(err => this.log.appendLine(`[Bridge] Could not mark ${tab.tabId}: ${err}`));
+		return { ok: true };
+	}
+
+	/**
+	 * Middleware for endpoints that can move the page: claims ownership/the
+	 * fallback lease and records that an agent is working in the target tab,
+	 * which is what numbers and marks it. Chained after the tab guards, so
+	 * the tab is known to exist and be permitted. Deliberately not applied to
+	 * reads — looking at a page is not working in it, a marker that appears
+	 * from a screenshot would be noise, and reads must never be blocked by
+	 * the fallback lease.
 	 */
 	private notesControl(): (req: express.Request, res: express.Response, next: express.NextFunction) => void {
-		return (req, _res, next) => {
+		return (req, res, next) => {
 			const { tab } = this.resolveTab(req);
 			if (!tab) {
+				// The handler's own resolveTab() reports the real error.
 				next();
 				return;
 			}
-			this.cdp.noteAgentControl(tab)
-				.catch(err => this.log.appendLine(`[Bridge] Could not mark ${tab.tabId}: ${err}`))
-				.then(() => next());
+			this.claimControl(tab, this.clientIdFor(req)).then(result => {
+				if (!result.ok) { res.json({ ok: false, error: result.error }); return; }
+				next();
+			});
 		};
 	}
 
-	/** Resolve the target tab for a request (query `?tabId=` or body `tabId`). */
+	/**
+	 * Resolve the target tab for a request (query `?tabId=` or body `tabId`).
+	 * A `tabId`-less request from a header-bearing client resolves through
+	 * that client's own tabs, never the global pointer or another client's
+	 * tab — see `CDPManager.getTab`.
+	 */
 	private resolveTab(req: express.Request): { tab?: CDPTab; error?: string } {
 		const tabId = (req.query.tabId as string | undefined) ?? (req.body?.tabId as string | undefined);
-		const tab = this.cdp.getTab(tabId);
+		const clientId = this.clientIdFor(req);
+		const tab = this.cdp.getTab(tabId, clientId);
 		if (!tab) {
 			// Distinguish "revoked" from "never existed": an agent holding a
 			// tabId from before enforcement ran needs to know its access was
 			// withdrawn, not that it mistyped an id.
 			const revoked = this.revokedErrorFor(req);
 			if (revoked) return { error: revoked };
-			return { error: tabId ? `No tab with id ${tabId}` : 'No active tab. Use browser_tab_open first.' };
+			if (tabId) return { error: `No tab with id ${tabId}` };
+			if (clientId) return { error: 'This session has no browser tab yet. browser_navigate with a url opens one, or pass a tabId from browser_tab_list.' };
+			return { error: 'No active tab. Use browser_tab_open first.' };
 		}
 		return { tab };
 	}
 
 	private setupRoutes(): void {
+		// Fallback-path lease upkeep for EVERY request, reads included: "refreshed
+		// by ANY request it makes" only extends a lease this client already holds
+		// (a no-op otherwise), so a read from a different session can never steal
+		// or extend it — only a controlling call (claimControl, below) can claim
+		// an unheld or expired one. No-op entirely once multi-tab is available.
+		this.app.use((req, _res, next) => {
+			const clientId = this.clientIdFor(req);
+			if (clientId && !hasProposedBrowserApi()) this.cdp.clients.touchLease(clientId);
+			next();
+		});
+
 		const existingTab = this.requireExistingTab();
 		const anyTabLazyNavigate = this.requireAnyTab(req => req.body?.url as string | undefined);
 		// Endpoints that can move the page also claim the tab (number + marker).
 		const controls = this.notesControl();
 
 		// Health / diagnostic
-		this.app.get('/status', async (_req, res) => {
+		this.app.get('/status', async (req, res) => {
 			// Report what this build can actually do *before* a tool has to find
 			// out by failing.
 			const proposedApi = hasProposedBrowserApi();
@@ -384,7 +441,9 @@ export class BridgeServer {
 					endpoint: this.socketPath
 						? { transport: 'socket', socketPath: this.socketPath }
 						: { transport: 'tcp', port: this.port },
-					activeTabId: this.cdp.activeTabId,
+					// Scoped to the requesting client once it sends an `X-Bridge-Client`
+					// header — the global pointer would leak another session's tab.
+					activeTabId: this.cdp.activeTabIdFor(this.clientIdFor(req)),
 					tabCount: this.cdp.tabCount,
 					pageSessionId: this.cdp.pageSessionId,
 					children: this.cdp.children,
@@ -397,18 +456,19 @@ export class BridgeServer {
 		});
 
 		// Tab management
-		this.app.get('/tabs', async (_req, res) => {
+		this.app.get('/tabs', async (req, res) => {
 			// Enforce first: a revoked tab must not be listed, because listing
 			// it is how an agent re-acquires a tabId it should no longer have.
 			await this.enforceTabAccess().catch(() => undefined);
+			const clientId = this.clientIdFor(req);
 			// Backfill titles the websocket path never populates, so tabs don't
 			// come back as untitled. Best-effort and bounded to connected tabs.
 			await Promise.all(
-				this.cdp.list()
+				this.cdp.list(clientId)
 					.filter(info => !info.title && info.state === 'connected')
 					.map(info => this.cdp.getTab(info.tabId)?.refreshTitle().catch(() => undefined)),
 			);
-			res.json({ ok: true, data: this.cdp.list() });
+			res.json({ ok: true, data: this.cdp.list(clientId) });
 		});
 
 		this.app.post('/tab/open', async (req, res) => {
@@ -420,7 +480,7 @@ export class BridgeServer {
 					res.json({ ok: false, error: 'Missing url' });
 					return;
 				}
-				const tab = await this.cdp.openTab(url, makeActive, beside);
+				const tab = await this.cdp.openTab(url, makeActive, beside, this.clientIdFor(req));
 				res.json({ ok: true, data: { tabId: tab.tabId, url: tab.url, title: tab.title, icon: tab.iconUri } });
 			} catch (err) {
 				res.json({ ok: false, error: String(err instanceof Error ? err.message : err) });
@@ -430,6 +490,13 @@ export class BridgeServer {
 		this.app.post('/tab/close/:tabId', this.guarded(async (req, res) => {
 			try {
 				const tabId = String(req.params.tabId);
+				// Closing the one fallback tab frees its lease, so it has to
+				// respect that lease or it becomes the way around the lock.
+				const clientId = this.clientIdFor(req);
+				if (clientId && !hasProposedBrowserApi()) {
+					const claim = this.cdp.clients.claimLease(clientId);
+					if (!claim.ok) { res.json({ ok: false, error: leaseBusyError(claim.since) }); return; }
+				}
 				await this.cdp.closeTab(tabId);
 				res.json({ ok: true, data: { closed: tabId } });
 			} catch (err) {
@@ -440,23 +507,50 @@ export class BridgeServer {
 		this.app.post('/tab/activate/:tabId', this.guarded((req, res) => {
 			try {
 				const tabId = String(req.params.tabId);
-				this.cdp.activate(tabId);
+				this.cdp.activate(tabId, this.clientIdFor(req));
 				res.json({ ok: true, data: { active: tabId } });
 			} catch (err) {
 				res.json({ ok: false, error: String(err instanceof Error ? err.message : err) });
 			}
 		}));
 
+		// A session announcing it is gone (stdin closed / SIGINT / SIGTERM in
+		// mcp-server.ts). Best-effort: frees its owned tabs and its fallback
+		// lease immediately instead of waiting out the lease TTL. No tab guard —
+		// there is nothing to enforce, just bookkeeping to drop.
+		this.app.post('/client/release', (req, res) => {
+			const clientId = this.clientIdFor(req);
+			if (clientId) this.cdp.clients.release(clientId);
+			res.json({ ok: true, data: { released: Boolean(clientId) } });
+		});
+
 		// Navigation
-		this.app.post('/navigate', anyTabLazyNavigate, controls, async (req, res) => {
+		this.app.post('/navigate', anyTabLazyNavigate, async (req, res) => {
 			try {
-				const { url } = req.body;
+				const { url, tabId } = req.body;
 				if (!url) {
 					res.json({ ok: false, error: 'Missing url' });
 					return;
 				}
+				const clientId = this.clientIdFor(req);
+				// tabId-less navigate from a header-bearing client that resolves to
+				// no tab of its own (tabs exist, but none is active for / owned by
+				// this client — the ordinary case for a second session's first
+				// call): open a fresh tab for it instead of hijacking whatever the
+				// global pointer happens to be. Navigates straight to `url` so the
+				// page doesn't load twice (about:blank, then this url).
+				if (!tabId && clientId && hasProposedBrowserApi() && !this.cdp.getTab(undefined, clientId)) {
+					const tab = await this.cdp.openTab(url, true, false, clientId);
+					res.json({ ok: true, data: { tabId: tab.tabId, url: tab.url, title: tab.title } });
+					return;
+				}
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
+				const claim = await this.claimControl(resolved.tab, clientId);
+				if (!claim.ok) { res.json({ ok: false, error: claim.error }); return; }
+				// tabId-less navigate sets this client's own active tab, same as
+				// /tab/open with makeActive and /tab/activate.
+				if (!tabId && clientId) this.cdp.setActiveForClient(resolved.tab.tabId, clientId);
 				const result = await resolved.tab.send('Page.navigate', { url });
 				// Settle the title before answering: on the websocket path nothing
 				// else populates it, so a caller reading straight from the response
@@ -1020,20 +1114,25 @@ export class BridgeServer {
 			}
 		});
 
-		// Console — filter by tabId when provided, aggregated otherwise
+		// Console — filter by tabId when provided, aggregated over the caller's
+		// own tabs otherwise (every tab for a legacy caller)
 		this.app.get('/console', this.guarded((req, res) => {
 			const limit = parseInt(req.query.limit as string) || 50;
 			const tabId = req.query.tabId as string | undefined;
-			const entries = tabId ? this.cdp.consoleForTab(tabId) : this.cdp.console;
+			const entries = tabId
+				? this.cdp.consoleForTab(tabId)
+				: this.cdp.scopedTabIds(this.clientIdFor(req)).flatMap(id => this.cdp.consoleForTab(id)).sort((a, b) => a.timestamp - b.timestamp);
 			res.json({ ok: true, data: entries.slice(-limit) });
 		}));
 
-		// Network — filter by tabId when provided, aggregated otherwise
+		// Network — same scoping as console
 		this.app.get('/network', this.guarded((req, res) => {
 			const limit = parseInt(req.query.limit as string) || 50;
 			const tabId = req.query.tabId as string | undefined;
 			const filter = req.query.filter as string | undefined;
-			let entries = tabId ? this.cdp.networkForTab(tabId) : this.cdp.network;
+			let entries = tabId
+				? this.cdp.networkForTab(tabId)
+				: this.cdp.scopedTabIds(this.clientIdFor(req)).flatMap(id => this.cdp.networkForTab(id)).sort((a, b) => a.timestamp - b.timestamp);
 			if (filter) {
 				entries = entries.filter(e => e.url.includes(filter));
 			}
@@ -1042,8 +1141,16 @@ export class BridgeServer {
 
 		this.app.post('/network/clear', this.guarded((req, res) => {
 			const tabId = req.query.tabId as string | undefined;
-			this.cdp.clearNetwork(tabId);
-			res.json({ ok: true, data: { cleared: tabId ?? 'all' } });
+			const clientId = this.clientIdFor(req);
+			if (tabId || !clientId) {
+				this.cdp.clearNetwork(tabId);
+				res.json({ ok: true, data: { cleared: tabId ?? 'all' } });
+				return;
+			}
+			// A session's tabId-less clear wipes only its own tabs' logs.
+			const ids = this.cdp.scopedTabIds(clientId);
+			for (const id of ids) this.cdp.clearNetwork(id);
+			res.json({ ok: true, data: { cleared: ids } });
 		}));
 
 		// Download behavior. Replaces the native save dialog with a configured
@@ -1078,7 +1185,9 @@ export class BridgeServer {
 		this.app.get('/downloads', this.guarded((req, res) => {
 			const limit = parseInt(req.query.limit as string) || 20;
 			const tabId = req.query.tabId as string | undefined;
-			const entries = tabId ? this.cdp.downloadsForTab(tabId) : this.cdp.downloads;
+			const entries = tabId
+				? this.cdp.downloadsForTab(tabId)
+				: this.cdp.scopedTabIds(this.clientIdFor(req)).flatMap(id => this.cdp.downloadsForTab(id)).sort((a, b) => a.startedAt - b.startedAt);
 			res.json({ ok: true, data: entries.slice(-limit) });
 		}));
 

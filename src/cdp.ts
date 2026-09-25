@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import { CDPTab, CDPState, ConsoleEntry, NetworkEntry, DownloadEntry } from './cdp-tab';
 import { allowsAllExistingTabs } from './sharing';
+import { ClientRegistry } from './clients';
 
 export { CDPState, ConsoleEntry, NetworkEntry, DownloadEntry };
 
@@ -161,6 +162,13 @@ export class CDPManager {
 	readonly ownerId = 'owner-' + crypto.randomBytes(6).toString('hex');
 
 	/**
+	 * Per-`X-Bridge-Client` bookkeeping (active tab, ownership, the
+	 * fallback-path lease) — see `clients.ts`. One registry per CDPManager,
+	 * so it resets naturally on every bridge (re)start along with the tabs.
+	 */
+	readonly clients = new ClientRegistry();
+
+	/**
 	 * The title prefix a tab should carry, or null for "leave the title alone".
 	 *
 	 * Only tabs an agent has worked in are marked. The bridge attaches to
@@ -215,6 +223,10 @@ export class CDPManager {
 					// The agent's click opened it, so it counts as worked-in too.
 					tab.agentControlled = true;
 					if (tab.displayNumber === null) tab.displayNumber = this.allocateNumber();
+					// And it belongs to the same client's working set as the
+					// opener, not to whichever client happens to touch it next.
+					const openerClientId = this.clients.owner(other.tabId);
+					if (openerClientId) this.clients.setOwner(tab.tabId, openerClientId);
 					this.log.appendLine(`[Bridge] Tab ${tab.tabId} inherited ownership from opener ${openerId}`);
 					return;
 				}
@@ -224,13 +236,21 @@ export class CDPManager {
 		}
 	}
 
-	private async claimOwnership(tab: CDPTab, makeActive = false): Promise<CDPTab> {
+	private async claimOwnership(tab: CDPTab, makeActive = false, clientId?: string): Promise<CDPTab> {
 		// Apply makeActive even if ownership was already set: when the open event
 		// wins the race, openTab's makeActive intent reaches only here, and
 		// without this the newly opened (visually focused) tab is not the active
 		// one, so later tabId-less calls drive the wrong page.
-		if (makeActive) this._activeTabId = tab.tabId;
+		if (makeActive) {
+			this._activeTabId = tab.tabId;
+			if (clientId) this.clients.setActive(clientId, tab.tabId);
+		}
 		tab.bridgeOwned = true;
+		// The client that opened this tab is its outright owner — same
+		// contract as `/tab/open`. A legacy caller (no header) assigns no
+		// owner, so the tab stays claimable by the first header-bearing
+		// client that later works in it.
+		if (clientId) this.clients.setOwner(tab.tabId, clientId);
 		// Opening a tab is itself an agent action, so it starts out controlled.
 		await this.noteAgentControl(tab);
 		if (makeActive) this.emitStateChange();
@@ -308,27 +328,79 @@ export class CDPManager {
 	}
 
 	/**
-	 * Resolve a tab. When `tabId` is omitted, returns the active tab, or the
-	 * only tab if there's exactly one, or `undefined`.
+	 * A client's own active tab: its stored active tab if still open, else the
+	 * most recent other tab it owns, else — only on the single-tab fallback
+	 * path, where isolation is impossible — the sole tab. See `clients.ts`.
+	 * Never falls through to another client's tab or the global pointer.
 	 */
-	getTab(tabId?: string): CDPTab | undefined {
+	private resolveActiveTabIdFor(clientId: string): string | null {
+		const openTabIds = new Set(this.tabs.keys());
+		const fallbackTabId = !hasProposedBrowserApi() && this.tabs.size === 1
+			? this.tabs.keys().next().value ?? null
+			: null;
+		return this.clients.resolveActive(clientId, openTabIds, fallbackTabId);
+	}
+
+	/** Same notion as `activeTabId`, scoped to one client once it sends an `X-Bridge-Client` header; the global pointer for a legacy caller. */
+	activeTabIdFor(clientId?: string): string | null {
+		return clientId ? this.resolveActiveTabIdFor(clientId) : this._activeTabId;
+	}
+
+	/**
+	 * Resolve a tab. `tabId` explicit always wins — any client can reach any
+	 * tab by id, which is how a tab gets handed from one session to another.
+	 * Omitted from a header-bearing client resolves through that client's own
+	 * tabs (see `resolveActiveTabIdFor`); omitted from a legacy caller keeps
+	 * the original global-pointer / only-tab behaviour untouched.
+	 */
+	getTab(tabId?: string, clientId?: string): CDPTab | undefined {
 		if (tabId) return this.tabs.get(tabId);
+		if (clientId) {
+			const id = this.resolveActiveTabIdFor(clientId);
+			return id ? this.tabs.get(id) : undefined;
+		}
 		if (this._activeTabId) return this.tabs.get(this._activeTabId);
 		if (this.tabs.size === 1) return this.tabs.values().next().value;
 		return undefined;
 	}
 
-	list(): TabInfo[] {
+	/** `active` marks the requesting client's own active tab once `clientId` is given; the global pointer otherwise. */
+	list(clientId?: string): TabInfo[] {
+		const activeId = clientId ? this.resolveActiveTabIdFor(clientId) : this._activeTabId;
 		return Array.from(this.tabs.values()).map(tab => ({
 			tabId: tab.tabId,
 			number: tab.displayNumber,
 			url: tab.url,
 			title: tab.title,
 			icon: compactIcon(tab.iconUri),
-			active: tab.tabId === this._activeTabId,
+			active: tab.tabId === activeId,
 			state: tab.state,
 			transport: tab.transport,
 		}));
+	}
+
+	/**
+	 * The tabs a tabId-less log call (console, network, downloads, network
+	 * clear) covers: every tab for a legacy caller, as before; for a client,
+	 * the tabs it owns plus whatever its own active tab resolves to — so one
+	 * session neither reads nor wipes another session's logs.
+	 */
+	scopedTabIds(clientId?: string): string[] {
+		if (!clientId) return Array.from(this.tabs.keys());
+		const ids = new Set(this.clients.ownedTabIds(clientId).filter(id => this.tabs.has(id)));
+		const active = this.resolveActiveTabIdFor(clientId);
+		if (active) ids.add(active);
+		return Array.from(ids);
+	}
+
+	/** Assign ownership of `tab` to `clientId` if nobody owns it yet. No-op for a legacy caller (no header) — legacy never claims ownership. */
+	claimTabForClient(tab: CDPTab, clientId?: string): void {
+		if (clientId) this.clients.claimIfUnowned(tab.tabId, clientId);
+	}
+
+	/** Set `clientId`'s own active tab, alongside the existing global pointer (status bar, legacy callers). */
+	setActiveForClient(tabId: string, clientId?: string): void {
+		if (clientId) this.clients.setActive(clientId, tabId);
 	}
 
 	/**
@@ -340,7 +412,7 @@ export class CDPManager {
 	 * complete before the destination page loads, otherwise a web worker
 	 * spawned on initial load can race our auto-attach and never get captured.
 	 */
-	async openTab(url: string, makeActive = true, beside = false): Promise<CDPTab> {
+	async openTab(url: string, makeActive = true, beside = false, clientId?: string): Promise<CDPTab> {
 		if (!hasProposedBrowserApi()) {
 			throw new Error(
 				'Multi-tab is unavailable in this build: the `browser` API proposal is declared but not granted, '
@@ -361,7 +433,7 @@ export class CDPManager {
 			// the default stays in the current group.
 			...(beside ? { viewColumn: vscode.ViewColumn.Beside } : {}),
 		});
-		const tab = await this.adoptBrowserTab(browserTab, makeActive, true);
+		const tab = await this.adoptBrowserTab(browserTab, makeActive, true, clientId);
 		if (url !== 'about:blank') {
 			await tab.send('Page.navigate', { url });
 			// Don't return until the tab reports the destination. Returning
@@ -379,7 +451,7 @@ export class CDPManager {
 	 * tracked. Called both for tabs we created via {@link openTab} and for
 	 * tabs the user opened via VS Code UI (via `onDidOpenBrowserTab`).
 	 */
-	async adoptBrowserTab(browserTab: vscode.BrowserTab, makeActive = false, bridgeOwned = false): Promise<CDPTab> {
+	async adoptBrowserTab(browserTab: vscode.BrowserTab, makeActive = false, bridgeOwned = false, clientId?: string): Promise<CDPTab> {
 		// An in-flight adoption takes priority: a concurrent caller must wait
 		// for the connect + title-prefix to finish, not grab the half-built
 		// tab reference from the map.
@@ -390,9 +462,9 @@ export class CDPManager {
 		// as the user's: no indicator, and it would be revoked as a page the
 		// bridge had no business driving.
 		const pending = this.pendingAdoptions.get(browserTab);
-		if (pending) return bridgeOwned ? pending.then(tab => this.claimOwnership(tab, makeActive)) : pending;
+		if (pending) return bridgeOwned ? pending.then(tab => this.claimOwnership(tab, makeActive, clientId)) : pending;
 		for (const tab of this.tabs.values()) {
-			if (tab.browserTab === browserTab) return bridgeOwned ? this.claimOwnership(tab, makeActive) : tab;
+			if (tab.browserTab === browserTab) return bridgeOwned ? this.claimOwnership(tab, makeActive, clientId) : tab;
 		}
 		const promise = (async () => {
 			const tab = new CDPTab(generateTabId(), this.log);
@@ -404,6 +476,10 @@ export class CDPManager {
 			if (bridgeOwned) {
 				tab.agentControlled = true;
 				tab.displayNumber = this.allocateNumber();
+				// A fresh bridge-owned tab is unowned by construction, so the
+				// client that asked for it (if any — a legacy caller assigns
+				// nothing) is its outright owner, same as `/tab/open`.
+				if (clientId) this.clients.setOwner(tab.tabId, clientId);
 			}
 			this.registerTab(tab);
 			await tab.connectToBrowserTab(browserTab);
@@ -424,6 +500,7 @@ export class CDPManager {
 			const prefix = this.indicatorPrefixFor(tab);
 			if (prefix) await tab.setTitlePrefix(prefix, this.ownerId);
 			if (makeActive || this.tabs.size === 1) this._activeTabId = tab.tabId;
+			if (makeActive && clientId) this.clients.setActive(clientId, tab.tabId);
 			this.emitStateChange();
 			return tab;
 		})();
@@ -437,7 +514,7 @@ export class CDPManager {
 	 * tab with id `tab-main`. `bridgeOwned` is true only for the session
 	 * `launchBrowser()` started; returns null when an unowned session is refused.
 	 */
-	async adoptDebugSession(session: vscode.DebugSession, bridgeOwned: boolean): Promise<CDPTab | null> {
+	async adoptDebugSession(session: vscode.DebugSession, bridgeOwned: boolean, clientId?: string): Promise<CDPTab | null> {
 		const existing = this.tabs.get('tab-main');
 		if (existing) return existing;
 		// A session the bridge did not launch is the user's own browser, and the
@@ -458,12 +535,14 @@ export class CDPManager {
 		if (bridgeOwned) {
 			tab.agentControlled = true;
 			tab.displayNumber = this.allocateNumber();
+			if (clientId) this.clients.setOwner(tab.tabId, clientId);
 		}
 		this.registerTab(tab);
 		await tab.connectToSession(session);
 		const prefix = this.indicatorPrefixFor(tab);
 		if (prefix) await tab.setTitlePrefix(prefix, this.ownerId);
 		this._activeTabId = 'tab-main';
+		if (clientId) this.clients.setActive(clientId, 'tab-main');
 		this.emitStateChange();
 		return tab;
 	}
@@ -496,6 +575,7 @@ export class CDPManager {
 		this.tabSubscriptions.get(tabId)?.dispose();
 		this.tabSubscriptions.delete(tabId);
 		this.tabs.delete(tabId);
+		this.clients.removeTab(tabId);
 		if (this._activeTabId === tabId) {
 			this._activeTabId = this.tabs.size > 0 ? this.tabs.keys().next().value ?? null : null;
 		}
@@ -528,6 +608,7 @@ export class CDPManager {
 		this.tabSubscriptions.get(tabId)?.dispose();
 		this.tabSubscriptions.delete(tabId);
 		this.tabs.delete(tabId);
+		this.clients.removeTab(tabId);
 		if (this._activeTabId === tabId) {
 			this._activeTabId = this.tabs.size > 0 ? this.tabs.keys().next().value ?? null : null;
 		}
@@ -567,6 +648,7 @@ export class CDPManager {
 		this.tabSubscriptions.get(tabId)?.dispose();
 		this.tabSubscriptions.delete(tabId);
 		this.tabs.delete(tabId);
+		this.clients.removeTab(tabId);
 		if (this._activeTabId === tabId) {
 			this._activeTabId = this.tabs.size > 0 ? this.tabs.keys().next().value ?? null : null;
 		}
@@ -589,6 +671,7 @@ export class CDPManager {
 				this.tabSubscriptions.get(tab.tabId)?.dispose();
 				this.tabSubscriptions.delete(tab.tabId);
 				this.tabs.delete(tab.tabId);
+				this.clients.removeTab(tab.tabId);
 				if (this._activeTabId === tab.tabId) {
 					this._activeTabId = this.tabs.size > 0 ? this.tabs.keys().next().value ?? null : null;
 				}
@@ -620,9 +703,10 @@ export class CDPManager {
 		}
 	}
 
-	activate(tabId: string): void {
+	activate(tabId: string, clientId?: string): void {
 		if (!this.tabs.has(tabId)) throw new Error(`No tab: ${tabId}`);
 		this._activeTabId = tabId;
+		if (clientId) this.clients.setActive(clientId, tabId);
 	}
 
 	/** Aggregated across all tabs, stamped with originating tabId. */

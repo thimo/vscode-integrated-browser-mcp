@@ -4,12 +4,23 @@ import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
+import * as crypto from 'crypto';
 import { describeEndpoint, foreignWindowNote, readInstances, resolveTarget } from './instances';
 import type { Instance, Resolution } from './instances';
 
 // Replaced at build time by esbuild's `define` (see esbuild.js). Keeps
 // package.json as the single source of truth for the version string.
 declare const __PKG_VERSION__: string;
+
+/**
+ * One id per MCP server process, generated once at startup and sent as
+ * `X-Bridge-Client` on every bridge request. This is what lets the bridge
+ * tell this Claude Code session's tabId-less calls apart from another
+ * session's — without it, every session looks identical to the bridge and
+ * they fight over one global "active tab" pointer (see `src/clients.ts` on
+ * the extension side).
+ */
+const CLIENT_ID = 'client-' + crypto.randomBytes(6).toString('hex');
 
 /**
  * Which VS Code window this process talks to, and how that was decided. See
@@ -43,12 +54,16 @@ function discoverInstance(): Instance | null {
 const REQUEST_TIMEOUT_MS = 30000;
 
 function requestOne(endpoint: { socketPath?: string; port?: number }, urlPath: string, method: string, body?: string): Promise<string> {
-	const options: http.RequestOptions = endpoint.socketPath
-		? { socketPath: endpoint.socketPath, path: urlPath, method, timeout: REQUEST_TIMEOUT_MS }
-		: { host: '127.0.0.1', port: endpoint.port, path: urlPath, method, timeout: REQUEST_TIMEOUT_MS };
+	// Sent on every request, body or not: reads need it too, so the bridge can
+	// tell this session's tabId-less GETs apart from another session's.
+	const headers: http.OutgoingHttpHeaders = { 'X-Bridge-Client': CLIENT_ID };
 	if (body) {
-		options.headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+		headers['Content-Type'] = 'application/json';
+		headers['Content-Length'] = Buffer.byteLength(body);
 	}
+	const options: http.RequestOptions = endpoint.socketPath
+		? { socketPath: endpoint.socketPath, path: urlPath, method, timeout: REQUEST_TIMEOUT_MS, headers }
+		: { host: '127.0.0.1', port: endpoint.port, path: urlPath, method, timeout: REQUEST_TIMEOUT_MS, headers };
 	return new Promise((resolve, reject) => {
 		const req = http.request(options, res => {
 			let data = '';
@@ -154,7 +169,7 @@ Two very different setups, so check \`browser_status\` \`capabilities\` before p
 - **Proposed API granted** (\`capabilities.tabOpen: true\`) — full multi-tab. Open your own tab with \`browser_tab_open\` and pass its \`tabId\` everywhere.
 - **Not granted** (the default for a normally-installed build) — \`browser_tab_open\` fails, and a browser the user opened themselves is attached only when \`allowAllExistingTabs\` is on. Otherwise the way to get a working tab is \`browser_navigate\` with **no** \`tabId\`: the bridge lazy-launches its own single tab and navigates it. This opens a separate page rather than taking over the user's, so it is not hijacking — but confirm with the user first if a page is already open, since the bridge tab is the only one you can drive.
 
-Target a specific tab by passing \`tabId\` (from \`browser_tab_list\` or \`browser_tab_open\`) to any interaction tool. Omit \`tabId\` to use the active tab.
+Each session running this MCP server (one per Claude Code conversation) has its own notion of "the active tab": omitting \`tabId\` always targets a tab THIS session opened or last acted on, never another session's page. Pass an explicit \`tabId\` (from \`browser_tab_list\` or \`browser_tab_open\`) to reach any tab, including one another session is using — that is how a tab gets handed from one session to another. On the debug-session fallback path (no proposed API — a single tab, shared) isolation is impossible, so that one tab is locked to whichever session is using it instead: a controlling call from a different session is refused until it frees up (that session ends, or 5 minutes idle). Reads are never blocked.
 
 Pick the cheapest tool for the job:
 - \`browser_eval\` with a small JS expression is the fastest way to read specific data (title, element text, form state, URL, computed values). Prefer this over dumping the whole DOM.
@@ -177,7 +192,7 @@ const server = new McpServer({
 	instructions: SERVER_INSTRUCTIONS,
 });
 
-const tabIdDescription = 'Optional browser tab id (e.g. "tab-ab12cd"). Omit to use the active tab. Use browser_tab_list to see tab ids.';
+const tabIdDescription = 'Optional browser tab id (e.g. "tab-ab12cd"). Omit to use THIS session\'s own active tab — each Claude Code session gets its own tabs, so omitting it never lands on another session\'s page. Pass an explicit tabId to reach any tab, including one another session opened. Use browser_tab_list to see tab ids.';
 
 // Navigate
 server.tool(
@@ -417,10 +432,10 @@ server.tool(
 // Console
 server.tool(
 	'browser_console',
-	'Read recent console output (last 200 per tab). Each entry has type, text, timestamp, tabId, and optional target (worker/iframe/service_worker). Omit tabId to aggregate across all tabs.',
+	'Read recent console output (last 200 per tab). Each entry has type, text, timestamp, tabId, and optional target (worker/iframe/service_worker). Omit tabId to aggregate across this session\'s own tabs.',
 	{
 		limit: z.number().int().min(1).max(200).default(50).describe('Max entries to return'),
-		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across all tabs.'),
+		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across this session\'s own tabs.'),
 	},
 	async ({ limit, tabId }) => {
 		const params = new URLSearchParams({ limit: String(limit) });
@@ -436,7 +451,7 @@ server.tool(
 	{
 		limit: z.number().int().min(1).max(200).default(50).describe('Max entries to return'),
 		filter: z.string().optional().describe('Filter URLs containing this string'),
-		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across all tabs.'),
+		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across this session\'s own tabs.'),
 	},
 	async ({ limit, filter, tabId }) => {
 		const params = new URLSearchParams({ limit: String(limit) });
@@ -450,7 +465,7 @@ server.tool(
 server.tool(
 	'browser_network_clear',
 	'Clear the buffered network request log',
-	{ tabId: z.string().optional().describe('Clear one tab only. Omit to clear all tabs.') },
+	{ tabId: z.string().optional().describe('Clear one tab only. Omit to clear this session\'s own tabs.') },
 	async ({ tabId }) => {
 		const qs = tabId ? `?tabId=${encodeURIComponent(tabId)}` : '';
 		return toMcpResult(await bridgeFetch(`/network/clear${qs}`, { method: 'POST' }));
@@ -493,7 +508,7 @@ server.tool(
 	'Read recent download events (last 50 per tab). Each entry: `{ guid, url, suggestedFilename, state, totalBytes?, receivedBytes?, downloadPath?, startedAt, updatedAt, tabId }`. State is `inProgress`, `completed`, or `canceled`. After completion with behavior:"allow", the file lives at `<downloadPath>/<suggestedFilename>` (Chromium adds " (1)" suffix on collision; not observable from CDP). Events only flow after `browser_download_set` has been called.',
 	{
 		limit: z.number().int().min(1).max(50).default(20).describe('Max entries to return'),
-		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across all tabs.'),
+		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across this session\'s own tabs.'),
 	},
 	async ({ limit, tabId }) => {
 		const params = new URLSearchParams({ limit: String(limit) });
@@ -578,6 +593,55 @@ server.tool(
 	{ tabId: z.string().describe('Tab id to activate') },
 	async ({ tabId }) => toMcpResult(await bridgePost(`/tab/activate/${encodeURIComponent(tabId)}`, {})),
 );
+
+/** Short timeout for the release-on-exit ping — never worth blocking process exit for. */
+const RELEASE_TIMEOUT_MS = 1500;
+
+/**
+ * Best-effort tell the bridge this session is gone: frees any tabs it owns
+ * for other sessions to claim, and — on the single-tab fallback path —
+ * releases its lease immediately instead of making the next session wait
+ * out the idle timeout. Never throws and never hangs: on any error, or past
+ * the timeout, it just gives up — the bridge's own idle expiry is the
+ * backstop if this never arrives (stdin/SIGKILL don't give a process a
+ * chance to run exit handlers at all).
+ */
+function releaseClient(): Promise<void> {
+	return new Promise(resolve => {
+		let settled = false;
+		const done = () => { if (!settled) { settled = true; resolve(); } };
+		try {
+			// The endpoint that last answered, not just the first candidate:
+			// on a socket→TCP fallback the first one is the dead one.
+			const endpoint = lastResolution?.used ?? resolveBridge().endpoints[0];
+			if (!endpoint) { done(); return; }
+			const options: http.RequestOptions = endpoint.socketPath
+				? { socketPath: endpoint.socketPath, path: '/client/release', method: 'POST', timeout: RELEASE_TIMEOUT_MS, headers: { 'X-Bridge-Client': CLIENT_ID } }
+				: { host: '127.0.0.1', port: endpoint.port, path: '/client/release', method: 'POST', timeout: RELEASE_TIMEOUT_MS, headers: { 'X-Bridge-Client': CLIENT_ID } };
+			const req = http.request(options, res => { res.resume(); res.on('end', done); res.on('error', done); });
+			req.on('timeout', () => { req.destroy(); done(); });
+			req.on('error', done);
+			req.end();
+			// Belt-and-braces: the socket-level timeout above should fire first,
+			// but this guarantees exit is never blocked longer than that.
+			setTimeout(done, RELEASE_TIMEOUT_MS + 200);
+		} catch {
+			done();
+		}
+	});
+}
+
+let releasing = false;
+async function releaseAndExit(code: number): Promise<void> {
+	if (releasing) return;
+	releasing = true;
+	await releaseClient();
+	process.exit(code);
+}
+
+process.stdin.on('close', () => { void releaseAndExit(0); });
+process.on('SIGINT', () => { void releaseAndExit(0); });
+process.on('SIGTERM', () => { void releaseAndExit(0); });
 
 async function main() {
 	const transport = new StdioServerTransport();

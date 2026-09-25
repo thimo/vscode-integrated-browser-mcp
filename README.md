@@ -66,7 +66,7 @@ See [HTTP API](#http-api) below for the full endpoint list.
 
 ## MCP tools
 
-All interaction tools accept an optional `tabId` parameter. Omit it to target the active tab.
+All interaction tools accept an optional `tabId` parameter. Omit it to target the active tab — each MCP session (one per Claude Code conversation) has its own active tab, so this never lands on another session's page; see [Per-session tab isolation](#per-session-tab-isolation).
 
 | Tool | Description |
 |------|-------------|
@@ -120,11 +120,12 @@ All interaction endpoints (navigate, eval, click, type, scroll, screenshot, snap
 | POST | `/download/set` | `{ path?, behavior?, tabId? }` | Configure download handling. `behavior` ∈ `allow` (default) / `allowAndName` / `deny` / `default`. `path` is required for `allow`/`allowAndName` and must be absolute when called directly (the MCP layer scopes workspace-relative paths). |
 | GET | `/downloads` | `?limit=N&tabId=X` | Buffered download events (last 50 per tab). Each entry: `{ guid, url, suggestedFilename, state, totalBytes?, receivedBytes?, downloadPath?, startedAt, updatedAt }`. |
 | GET | `/url` | `?tabId=X` | Current page URL |
-| GET | `/tabs` | — | List open tabs `[{ tabId, url, title, active, state, transport }]` |
+| GET | `/tabs` | — | List open tabs `[{ tabId, url, title, active, state, transport }]`. `active` is scoped to the requesting client (see below) when it sends `X-Bridge-Client`. |
 | POST | `/tab/open` | `{ url, makeActive? }` | Open a new tab (proposed API only). Returns `{ tabId, url, title }` |
 | POST | `/tab/close/:tabId` | — | Close a tab |
 | POST | `/tab/activate/:tabId` | — | Set the active (default) tab |
 | POST | `/pixel` | `{ selector?, points?, waitMs?, tabId? }` | Sample on-screen colour(s). `selector` samples that element's centre; `points` are page coordinates in CSS pixels. Returns `{ samples: [{ hex, r, g, b, a, x, y }] }`. |
+| POST | `/client/release` | — | Tell the bridge a session (`X-Bridge-Client`) is gone: frees the tabs it owns and its fallback-path lease. The bundled MCP server sends this on exit; direct callers rarely need it. |
 
 ## Multi-window support and endpoint discovery
 
@@ -203,7 +204,7 @@ Multi-tab support requires the proposed API (previous section). When enabled:
 - `browser_tab_open("https://example.com")` opens a new tab, returns its `tabId`.
 - `browser_tab_list()` shows all open tabs — the `active` flag marks which one receives commands by default, and the `number` field (1, 2, 3…) matches the `(N) ` prefix in each tab's title. Numbers are stable per tab with reuse: close tab 3 and the next new tab gets 3, but tab 4 stays tab 4 for its lifetime.
 - Every interaction tool (`browser_navigate`, `browser_eval`, `browser_click`, etc.) accepts an optional `tabId`. Omit it to target the active tab; pass it to target a specific tab.
-- `browser_console` and `browser_network` aggregate across all tabs by default — each entry carries the `tabId` of the tab it came from. Pass `tabId` to filter.
+- `browser_console` and `browser_network` aggregate across your session's own tabs by default (every tab for a caller without `X-Bridge-Client`) — each entry carries the `tabId` of the tab it came from. Pass `tabId` to filter.
 - Closing a tab in the VS Code UI is picked up automatically; the bridge untracks it and the `tabId` becomes invalid.
 
 The `(N) ` prefix is auto-applied even to pages without a `<title>` element (about:blank, raw API responses), and it re-applies after navigation. It lasts only as long as the bridge runs — stop it and the next page load is clean.
@@ -211,6 +212,17 @@ The `(N) ` prefix is auto-applied even to pages without a `<title>` element (abo
 **A tab is numbered and marked once an agent works in it,** and keeps that number until it closes. Reading a page — a screenshot, a snapshot — claims nothing. Pages you merely have open are never marked, and by default are not driven at all (see [Limitations and trust model](#limitations-and-trust-model)). `integratedBrowserMcp.tabIndicator` tunes the marking: `number` (default), `marker` (a fixed symbol via `integratedBrowserMcp.tabIndicatorMarker`, no ordering implied), or `off`. The prefix rewrites the page's real `document.title`, so the page can observe it — choose `off` if a page or tool needs the unmodified title.
 
 On the debug-session fallback path, the bridge always exposes exactly one tab (synthetic id `tab-main`) and `browser_tab_open` returns an error pointing to the proposed API.
+
+## Per-session tab isolation
+
+Several Claude Code sessions can talk to the same bridge at once — each spawns its own bundled `mcp-server.ts` process, but they all hit the same HTTP server and tab state. Each of those processes generates a random id at startup and sends it as `X-Bridge-Client` on every request, so the bridge can tell sessions apart:
+
+- **Omitting `tabId` targets *your* session's own active tab**, never another session's. If your session has no tab yet, `browser_navigate` opens one for you (a fresh tab if others already exist and the proposed API is available, same as `browser_tab_open`); other tabId-less calls return an error telling you to navigate or pass a `tabId` instead of silently doing nothing.
+- **A tab's owner is whichever session opened it** — via `browser_tab_open`, a tabId-less `browser_navigate`, or the first session to act on a tab nobody has claimed yet. Ownership only ever gets assigned once; it doesn't change hands later.
+- **Passing an explicit `tabId` still reaches any tab**, including one another session opened — that's how you hand a tab to another session: tell it the tab's number or id.
+- Direct HTTP callers (curl, scripts) that don't send `X-Bridge-Client` are treated as one shared "legacy" caller and get the pre-isolation behaviour: the single global active tab, same as before this feature existed.
+
+**On the debug-session fallback path** (no proposed API — see above) there is only ever one tab, so per-session tabs are impossible. The bridge locks that tab instead: whichever session last drove it holds a lease, refreshed by anything that session does. A controlling call (navigate, eval, click, type, scroll, emulate, download config, closing the tab) from a *different* session is refused with an error naming when the current holder was last active; reads (screenshot, snapshot, dom, url, markdown, console, network, pixel) are never blocked. The lease frees up when that session's MCP process exits (it sends `POST /client/release` on shutdown), when the tab closes, or after 5 minutes idle.
 
 ## Headless downloads
 

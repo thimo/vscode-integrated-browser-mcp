@@ -338,6 +338,133 @@ const section = name => console.log(`\n${name}`);
 	fs.rmSync(dir, { recursive: true, force: true });
 }
 
+// ---------------------------------------------------------------- clients
+{
+	section('ClientRegistry — per-session active tab, ownership, and the fallback-path lease');
+	const { ClientRegistry, leaseBusyError, FALLBACK_LEASE_TTL_MS } = await load('src/clients.ts');
+
+	// Active-tab resolution
+	{
+		const reg = new ClientRegistry();
+		eq('unknown client, no fallback, resolves to nothing', reg.resolveActive('a', new Set(['t1']), null), null);
+		eq('unknown client falls back on the single-tab path', reg.resolveActive('a', new Set(['t1']), 't1'), 't1');
+
+		reg.setActive('a', 't1');
+		eq('own active tab wins, no fallback needed', reg.resolveActive('a', new Set(['t1', 't2']), 't2'), 't1');
+		eq('never another client\'s tab even without one of its own', reg.resolveActive('b', new Set(['t1']), null), null);
+
+		eq('active tab that closed drops out', reg.resolveActive('a', new Set(['t2']), null), null);
+	}
+
+	// Ownership
+	{
+		const reg = new ClientRegistry();
+		eq('unclaimed tab has no owner', reg.owner('t1'), undefined);
+		reg.claimIfUnowned('t1', 'a');
+		eq('first claim wins', reg.owner('t1'), 'a');
+		reg.claimIfUnowned('t1', 'b');
+		eq('a later claim on an owned tab is a no-op', reg.owner('t1'), 'a');
+		reg.setOwner('t1', 'b');
+		eq('setOwner reassigns outright (unlike claimIfUnowned)', reg.owner('t1'), 'b');
+
+		// "the most recent other tab it owns": falls back to an owned tab once
+		// the active one is gone, most-recently-claimed first.
+		reg.setOwner('t2', 'c');
+		reg.setOwner('t3', 'c');
+		eq('falls back to the most recently claimed owned tab', reg.resolveActive('c', new Set(['t2', 't3']), null), 't3');
+		reg.setActive('c', 't2');
+		eq('an explicitly active tab still wins over ownership recency', reg.resolveActive('c', new Set(['t2', 't3']), null), 't2');
+	}
+
+	// Removing a tab (closed / revoked / untracked)
+	{
+		const reg = new ClientRegistry();
+		reg.setActive('a', 't1');
+		reg.setOwner('t1', 'a');
+		reg.setOwner('t2', 'a');
+		reg.removeTab('t1');
+		eq('removed tab loses its owner', reg.owner('t1'), undefined);
+		eq('removed active tab clears to null, not silently to another owned tab', reg.activeTabId('a'), null);
+		eq('other ownership untouched', reg.owner('t2'), 'a');
+		eq('falls back to the surviving owned tab once active is gone', reg.resolveActive('a', new Set(['t2']), null), 't2');
+	}
+
+	// Fallback-path lease
+	{
+		const reg = new ClientRegistry();
+		const t0 = 1_000_000;
+		eq('first controlling call claims the lease', reg.claimLease('a', t0), { ok: true });
+		eq('the same client refreshes its own lease', reg.claimLease('a', t0 + 1000), { ok: true });
+		const blocked = reg.claimLease('b', t0 + 2000);
+		eq('a different client is refused while the lease is live', blocked, { ok: false, since: t0 + 1000 });
+		// A blocked attempt has no side effect: the lease is still 'a's, unmoved.
+		eq('a refused claim does not steal the lease', reg.claimLease('b', t0 + 2000), { ok: false, since: t0 + 1000 });
+	}
+	{
+		// touchLease: refreshes only the current holder, never a bystander.
+		const reg = new ClientRegistry();
+		const t0 = 1_000_000;
+		reg.claimLease('a', t0);
+		reg.touchLease('b', t0 + 3000); // b does not hold it — no-op
+		eq('touchLease is a no-op for a client that does not hold the lease', reg.claimLease('b', t0 + 3000).ok, false);
+		reg.touchLease('a', t0 + 3000); // a refreshes its own
+		eq('touchLease refreshes the holder\'s lease', reg.claimLease('b', t0 + 3000 + FALLBACK_LEASE_TTL_MS - 1).ok, false);
+	}
+	{
+		// Past the TTL from the last refresh, the tab is up for grabs again.
+		const reg = new ClientRegistry();
+		const t0 = 1_000_000;
+		reg.claimLease('a', t0);
+		eq('lease expires after the TTL', reg.claimLease('b', t0 + FALLBACK_LEASE_TTL_MS + 1), { ok: true });
+	}
+	{
+		// release() frees a held lease immediately, without waiting out the TTL.
+		const reg = new ClientRegistry();
+		const t0 = 1_000_000;
+		reg.claimLease('a', t0);
+		reg.release('a');
+		eq('release frees a held lease immediately', reg.claimLease('b', t0 + 1), { ok: true });
+	}
+	{
+		// The client cap evicts the least-recently-used session, not the
+		// oldest busy one, and takes its ownership claims with it.
+		const reg = new ClientRegistry();
+		reg.setOwner('t1', 'a');
+		for (let i = 0; i < 199; i++) reg.setActive(`c${i}`, 'x');
+		reg.setActive('a', 't1');
+		reg.setActive('late', 'x');
+		eq('a recently used client survives the cap', reg.activeTabId('a'), 't1');
+		eq('the least-recently-used client is evicted', reg.activeTabId('c0'), null);
+		for (let i = 0; i < 200; i++) reg.setActive(`d${i}`, 'x');
+		eq('an evicted client loses its ownership claims', reg.owner('t1'), undefined);
+	}
+	{
+		// The lease guards the one fallback tab; once that tab is gone, the
+		// next session must be able to drive the tab it relaunches.
+		const reg = new ClientRegistry();
+		const t0 = 1_000_000;
+		reg.claimLease('a', t0);
+		reg.removeTab('tab-main');
+		eq('closing the fallback tab frees its lease', reg.claimLease('b', t0 + 1), { ok: true });
+	}
+
+	// release() also drops ownership and active-tab state
+	{
+		const reg = new ClientRegistry();
+		reg.setActive('a', 't1');
+		reg.setOwner('t1', 'a');
+		reg.setOwner('t2', 'a');
+		reg.release('a');
+		eq('released client has no active tab', reg.activeTabId('a'), null);
+		eq('released client\'s ownership claims are gone', [reg.owner('t1'), reg.owner('t2')], [undefined, undefined]);
+	}
+
+	// leaseBusyError: pure formatting, checked without the HTTP layer.
+	eq('reports a fresh lease in seconds', leaseBusyError(0, 15_000).includes('15s ago'), true);
+	eq('reports an older lease in minutes', leaseBusyError(0, 3 * 60_000).includes('3m ago'), true);
+	eq('names the two ways it frees up', leaseBusyError(0, 0).includes('frees up when that session ends or after 5 minutes idle'), true);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) {
 	console.log(`${failures} FAILED`);

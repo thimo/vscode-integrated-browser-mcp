@@ -272,7 +272,7 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
 
 		// 3. HTTP server (socket-first, TCP fallback)
 		httpServer = new BridgeServer(cdp, log, getWorkspacePath());
-		httpServer.setEnsureBrowser(url => ensureBrowser(url));
+		httpServer.setEnsureBrowser((url, clientId) => ensureBrowser(url, clientId));
 		actualEndpoint = await listenBest(httpServer, config, preferredPort);
 		running = true;
 		statusBar.update(cdp.state, true, cdp.transport, summarizeTabs());
@@ -358,7 +358,7 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
  * proposed API is available, open the tab directly to that URL to avoid an
  * about:blank flash.
  */
-async function ensureBrowser(url?: string): Promise<void> {
+async function ensureBrowser(url?: string, clientId?: string): Promise<void> {
 	if (cdp?.state === 'connected') return;
 	if (browserLaunching || cdp?.state === 'connecting') {
 		await new Promise<void>((resolve, reject) => {
@@ -392,7 +392,7 @@ async function ensureBrowser(url?: string): Promise<void> {
 	}
 	browserLaunching = true;
 	try {
-		await launchBrowser(url);
+		await launchBrowser(url, clientId);
 	} finally {
 		browserLaunching = false;
 	}
@@ -427,12 +427,13 @@ async function stopBridge(): Promise<void> {
 	log?.appendLine('[Bridge] Stopped');
 }
 
-async function launchBrowserViaProposedApi(): Promise<boolean> {
+async function launchBrowserViaProposedApi(clientId?: string): Promise<boolean> {
 	try {
 		log.appendLine('[Bridge] Launching via proposed browser API (openBrowserTab: about:blank)');
 		// Always open about:blank; the caller (e.g. /navigate handler) does the
-		// real navigation once the tab is connected.
-		await cdp.openTab('about:blank', true);
+		// real navigation once the tab is connected. The lazily-launching
+		// client owns the result, same as any other tab it opens.
+		await cdp.openTab('about:blank', true, false, clientId);
 		return true;
 	} catch (err) {
 		log.appendLine(`[Bridge] Proposed API launch failed: ${err}`);
@@ -440,7 +441,7 @@ async function launchBrowserViaProposedApi(): Promise<boolean> {
 	}
 }
 
-async function launchBrowser(_lazyUrl?: string): Promise<void> {
+async function launchBrowser(_lazyUrl?: string, clientId?: string): Promise<void> {
 	// The URL hint is currently unused for the proposed-API path (we always
 	// open about:blank and let the caller navigate). The debug-session path
 	// bakes it into the launch config so the very first page load is the
@@ -451,7 +452,7 @@ async function launchBrowser(_lazyUrl?: string): Promise<void> {
 	// vscode-js-debug entirely, eliminating the event-forwarding limitations
 	// that prevent worker/service-worker events from reaching us.
 	if (hasProposedBrowserApi()) {
-		const ok = await launchBrowserViaProposedApi();
+		const ok = await launchBrowserViaProposedApi(clientId);
 		if (ok) return;
 		log.appendLine('[Bridge] Falling back to debug-session launch');
 	}
@@ -511,7 +512,7 @@ async function launchBrowser(_lazyUrl?: string): Promise<void> {
 	}
 
 	try {
-		await cdp.adoptDebugSession(session, true);
+		await cdp.adoptDebugSession(session, true, clientId);
 	} catch (err) {
 		log.appendLine(`[Bridge] CDP connect error: ${err}`);
 	}
