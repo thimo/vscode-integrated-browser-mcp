@@ -72,17 +72,19 @@ All interaction tools accept an optional `tabId` parameter. Omit it to target th
 |------|-------------|
 | `browser_navigate` | Navigate to a URL |
 | `browser_eval` | Execute JavaScript in the page |
-| `browser_click` | Click an element by CSS selector |
+| `browser_click` | Click an element by CSS selector, using real mouse input by default (move, press, release — triggers pointer capture and popover light-dismiss). Returns `covered` when another element was on top of the click point. `script: true` restores the old `el.click()` behavior. |
+| `browser_drag` | Drag from one point/element to another with the mouse button genuinely held down across interpolated intermediate moves — drives pointer-capture-based sliders, sortable lists, resize handles. |
 | `browser_type` | Type text into an element by CSS selector. `submit: true` presses Enter afterwards — form fill + submit in one call. |
+| `browser_press_key` | Press a key (Escape, Enter, arrow keys, F1-F12, or any printable character) via real keyboard input. Optional `selector` to focus first, `modifiers` for Alt/Control/Meta/Shift. |
 | `browser_scroll` | Scroll the page or a specific element |
 | `browser_screenshot` | Capture page as PNG. `fullPage` for whole-document capture; `waitMs` to delay capture for in-flight CSS transitions. |
 | `browser_screenshot_slice` | Capture one viewport-height slice of a long page. For pages exceeding Chromium's single-PNG axis cap (~16k px). Pair with `browser_emulate` first. |
-| `browser_emulate` | Override viewport dimensions, DPR, mobile flag, and User-Agent. Sticky until `reset:true`. |
+| `browser_emulate` | Override viewport dimensions, DPR, mobile flag, User-Agent, and/or `colorScheme` (prefers-color-scheme). Sticky until `reset:true`. |
 | `browser_pixel` | Read the on-screen colour at a point or element centre, as numbers — sampled from the composited screenshot, so it works on WebGL canvases where in-page readback returns black. |
 | `browser_snapshot` | Get the accessibility tree as a compact pruned projection. Scope with `selector`, filter with `interactiveOnly`, cap with `limit`; `full: true` returns the raw CDP nodes. |
 | `browser_dom` | Get the full page HTML |
 | `browser_markdown` | Extract page content as markdown (lightweight DOM walker, not Turndown). Pass `outputPath` to write to disk instead of returning the body — workspace-scoped. |
-| `browser_console` | Read buffered console output (aggregates across tabs when `tabId` omitted) |
+| `browser_console` | Read buffered console output (aggregates across tabs when `tabId` omitted). Uncaught exceptions appear as `type: "exception"` entries. |
 | `browser_network` | Read buffered network requests (aggregates across tabs when `tabId` omitted) |
 | `browser_network_clear` | Clear the network log |
 | `browser_download_set` | Configure where downloads land (default `tmp/downloads`, workspace-scoped) and bypass the native save dialog. See [Headless downloads](#headless-downloads). |
@@ -105,13 +107,15 @@ All interaction endpoints (navigate, eval, click, type, scroll, screenshot, snap
 | GET | `/status` | — | Bridge health + diagnostics (workspace, transport, active tab, buffer sizes, event counts) |
 | POST | `/navigate` | `{ url, tabId? }` | Navigate to URL |
 | POST | `/eval` | `{ expression, tabId? }` | Run JS in page context |
-| POST | `/click` | `{ selector, tabId? }` | Click element by CSS selector |
+| POST | `/click` | `{ selector, script?, tabId? }` | Click element by CSS selector using real mouse input (move, press, release). Returns `{ clicked, x, y, method, covered }`. `script: true` clicks via `el.click()` instead — for zero-size elements or clicking through an overlay on purpose. |
+| POST | `/drag` | `{ from, to, steps?, tabId? }` | Drag with the mouse button held across interpolated moves. `from`/`to` are each a CSS selector or `{x, y}` in CSS px viewport coordinates. `steps` (default 10, 1-100) sets the number of intermediate moves. Returns `{ dragged, from: {x,y}, to: {x,y}, steps }`. |
 | POST | `/type` | `{ selector, text, submit?, tabId? }` | Type into element. `submit: true` presses Enter after typing. |
+| POST | `/press` | `{ key, modifiers?, selector?, tabId? }` | Press a key via real keyboard input. `key` is a Playwright-style name (Escape, Enter, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space, F1-F12) or any single printable character. `modifiers` is an array of `Alt`/`Control`/`Meta`/`Shift`. `selector` focuses that element first. |
 | POST | `/scroll` | `{ deltaX, deltaY, selector?, tabId? }` | Scroll page or element |
 | GET | `/screenshot` | `?tabId=X&fullPage=true&waitMs=N` | Base64 PNG screenshot. `fullPage=true` captures beyond the viewport. `waitMs` sleeps before capture (handles CSS transitions). |
 | GET | `/screenshot-slice` | `?slice=N&tabId=X` | Viewport-height slice plus metadata. `slice` is 0-indexed; negative from end. Omit `slice` for metadata only. |
 | GET | `/markdown` | `?selector=S&tabId=X` | Page content as markdown. `selector` defaults to `main` (falls back to `body`). |
-| POST | `/emulate` | `{ width, height, deviceScaleFactor?, mobile?, userAgent?, reset?, tabId? }` | Device-metric override. `{reset:true}` clears. |
+| POST | `/emulate` | `{ width, height, deviceScaleFactor?, mobile?, userAgent?, colorScheme?, reset?, tabId? }` | Device-metric and/or `colorScheme` (`dark`/`light`/`none`, i.e. prefers-color-scheme) override. `width`/`height` are required together but independent of `colorScheme` — pass either or both. `{reset:true}` clears everything. Response includes `colorSchemeApplied` when `colorScheme` was passed, and `zoom` when the browser/window zoom was compensated for (#22). |
 | GET | `/snapshot` | `?tabId=X` | Accessibility tree |
 | GET | `/dom` | `?tabId=X` | Full page outerHTML |
 | GET | `/console` | `?limit=N&tabId=X` | Buffered console output (last 200). Aggregates across tabs when `tabId` omitted. |

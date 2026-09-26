@@ -69,9 +69,12 @@ All responses: `{ ok: true, data: ... }` or `{ ok: false, error: "..." }`
 |--------|----------|------|-------------|
 | POST | `/navigate` | `{ url }` | Navigate to URL |
 | POST | `/eval` | `{ expression }` | Run JS, returns result |
-| POST | `/click` | `{ selector }` | Click by CSS selector |
+| POST | `/click` | `{ selector, script? }` | Click by CSS selector via real mouse input (move/press/release); `script: true` restores the old `el.click()` behavior |
+| POST | `/drag` | `{ from, to, steps? }` | Drag with the mouse button held across interpolated moves; `from`/`to` are a CSS selector or `{x,y}` |
 | POST | `/type` | `{ selector, text, submit? }` | Type into element; `submit: true` presses Enter after |
+| POST | `/press` | `{ key, modifiers?, selector? }` | Press a key via real keyboard input (Escape, arrows, F-keys, printable chars) |
 | POST | `/scroll` | `{ deltaX, deltaY, selector? }` | Scroll |
+| POST | `/emulate` | `{ width?, height?, deviceScaleFactor?, mobile?, userAgent?, colorScheme?, reset? }` | Device-metric and/or `colorScheme` (`dark`/`light`/`none`) override; `width`/`height` required together but independent of `colorScheme` |
 | GET  | `/screenshot` | — | Base64 PNG |
 | GET  | `/snapshot` | — | Accessibility tree, pruned + projected by default (`selector`, `interactiveOnly`, `limit`; `full=true` for the raw CDP nodes) |
 | GET  | `/dom` | — | Full page outer HTML |

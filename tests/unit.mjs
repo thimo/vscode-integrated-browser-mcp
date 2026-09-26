@@ -91,6 +91,102 @@ const section = name => console.log(`\n${name}`);
 	eq('tolerates a default port in the composed origin', strip('Local (http://localhost:80/)', 'http://localhost/app'), 'Local');
 }
 
+// -------------------------------------------------------------------- cdp-tab: exceptions
+{
+	section('exceptionToConsoleEntry — Runtime.exceptionThrown -> ConsoleEntry, issue #21');
+	const { exceptionToConsoleEntry } = await load('src/cdp-tab.ts');
+
+	eq('prefers the description (message + stack)', exceptionToConsoleEntry({
+		exceptionDetails: {
+			text: 'Uncaught',
+			url: 'https://example.com/app.js',
+			lineNumber: 12,
+			columnNumber: 4,
+			exception: { description: 'TypeError: x is not a function\n    at app.js:12:4' },
+		},
+	}, 1000), {
+		type: 'exception',
+		text: 'TypeError: x is not a function\n    at app.js:12:4',
+		timestamp: 1000,
+		url: 'https://example.com/app.js',
+		lineNumber: 12,
+		columnNumber: 4,
+	});
+
+	// `throw "a string"` has no `.description` — falls back to text + value.
+	eq('falls back to text + thrown value when there is no description', exceptionToConsoleEntry({
+		exceptionDetails: { text: 'Uncaught', exception: { value: 'boom' } },
+	}, 2000), { type: 'exception', text: 'Uncaught boom', timestamp: 2000 });
+
+	// No exception object at all (e.g. a rejected promise with no value).
+	eq('falls back to bare text with nothing else present', exceptionToConsoleEntry({
+		exceptionDetails: { text: 'Uncaught (in promise)' },
+	}, 3000), { type: 'exception', text: 'Uncaught (in promise)', timestamp: 3000 });
+
+	eq('tolerates a missing exceptionDetails entirely', exceptionToConsoleEntry({}, 4000), { type: 'exception', text: '', timestamp: 4000 });
+
+	// `throw { code: 42 }`: description is just the class name, which alone says less than `text`.
+	eq('a thrown plain object keeps the Uncaught marker', exceptionToConsoleEntry({
+		exceptionDetails: { text: 'Uncaught', exception: { className: 'Object', description: 'Object' } },
+	}, 5000), { type: 'exception', text: 'Uncaught Object', timestamp: 5000 });
+}
+
+// ------------------------------------------------------------------------ input
+{
+	section('input — key names, modifiers, drag interpolation for real pointer/keyboard events (issue #21)');
+	const { keyDefinition, modifiersBitmask, interpolate, clampSteps, SUPPORTED_KEY_NAMES } = await load('src/input.ts');
+
+	eq('Escape has no text (not a printable insert)', keyDefinition('Escape'), { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 });
+	eq('Enter inserts \\r, matching /type\'s submit', keyDefinition('Enter'), { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r' });
+	eq('F5 maps to the right vk', keyDefinition('F5'), { key: 'F5', code: 'F5', windowsVirtualKeyCode: 116, nativeVirtualKeyCode: 116 });
+	eq('a lowercase letter', keyDefinition('a'), { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, text: 'a', unmodifiedText: 'a' });
+	eq('an uppercase letter shares the physical key with lowercase', keyDefinition('A'), { key: 'A', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, text: 'A', unmodifiedText: 'A' });
+	eq('a digit', keyDefinition('1'), { key: '1', code: 'Digit1', windowsVirtualKeyCode: 49, nativeVirtualKeyCode: 49, text: '1', unmodifiedText: '1' });
+	eq('punctuation gets the real Windows VK, not the character code', keyDefinition('/'), { key: '/', code: 'Slash', windowsVirtualKeyCode: 191, nativeVirtualKeyCode: 191, text: '/', unmodifiedText: '/' });
+	eq('a shifted symbol shares the physical key with its base', keyDefinition('?'), { key: '?', code: 'Slash', windowsVirtualKeyCode: 191, nativeVirtualKeyCode: 191, text: '?', unmodifiedText: '?' });
+	eq('a shifted digit sits on the digit key', keyDefinition('@'), { key: '@', code: 'Digit2', windowsVirtualKeyCode: 50, nativeVirtualKeyCode: 50, text: '@', unmodifiedText: '@' });
+	eq('an unmapped printable character sends no VK rather than a wrong one', keyDefinition('€'), { key: '€', code: '', windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0, text: '€', unmodifiedText: '€' });
+	eq('the Space name reports the DOM key value, a literal space', keyDefinition('Space'), { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32, text: ' ', unmodifiedText: ' ' });
+	eq('Space is named, not the punctuation fallback', keyDefinition(' '), { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32, text: ' ', unmodifiedText: ' ' });
+	eq('unknown multi-character name is rejected', keyDefinition('Fooble'), undefined);
+	eq('every supported name actually resolves', SUPPORTED_KEY_NAMES.every(name => keyDefinition(name) !== undefined), true);
+
+	eq('no modifiers is zero', modifiersBitmask([]), 0);
+	eq('no modifiers argument at all', modifiersBitmask(), 0);
+	eq('single modifier', modifiersBitmask(['Shift']), 8);
+	eq('combined modifiers OR together', modifiersBitmask(['Control', 'Alt']), 3);
+	eq('all four', modifiersBitmask(['Alt', 'Control', 'Meta', 'Shift']), 15);
+	eq('an unknown modifier name contributes nothing', modifiersBitmask(['NotAModifier']), 0);
+
+	eq('one step is just the endpoint', interpolate({ x: 0, y: 0 }, { x: 100, y: 0 }, 1), [{ x: 100, y: 0 }]);
+	const four = interpolate({ x: 0, y: 0 }, { x: 100, y: 200 }, 4);
+	eq('N steps produces N points', four.length, 4);
+	eq('the last point is exactly `to`, not an approximation', four[3], { x: 100, y: 200 });
+	eq('the first point is partway, not `from` itself', four[0], { x: 25, y: 50 });
+	eq('clampSteps: absent means the default', clampSteps(undefined), 10);
+	eq('clampSteps: garbage means the default', clampSteps('lots'), 10);
+	eq('clampSteps: below the minimum clamps to 1', clampSteps(0), 1);
+	eq('clampSteps: above the maximum clamps to 100', clampSteps(500), 100);
+	eq('clampSteps: fractions truncate', clampSteps(7.9), 7);
+}
+
+// -------------------------------------------------------------------- emulation
+{
+	section('emulation — zoom compensation for /emulate, issue #22');
+	const { detectZoom, compensateForZoom } = await load('src/emulation.ts');
+	const req = { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false };
+
+	eq('the reported numbers: 1152 px and DPR 1.25 mean 125% zoom', detectZoom(req, { innerWidth: 1152, devicePixelRatio: 1.25 }), 1.25);
+	eq('an exact match is not zoom', detectZoom(req, { innerWidth: 1440, devicePixelRatio: 1 }), undefined);
+	eq('a dropped width (natural viewport, DPR unchanged) is not zoom', detectZoom(req, { innerWidth: 901, devicePixelRatio: 1 }), undefined);
+	eq('DPR and width must agree before anything is scaled', detectZoom(req, { innerWidth: 1152, devicePixelRatio: 2 }), undefined);
+	eq('a requested DPR other than 1 is factored out', detectZoom({ width: 1440, deviceScaleFactor: 2 }, { innerWidth: 1152, devicePixelRatio: 2.5 }), 1.25);
+	eq('a degenerate probe is ignored', detectZoom(req, { innerWidth: 0, devicePixelRatio: 0 }), undefined);
+
+	eq('compensation is what the reporter found by hand: 1800×1125 at DPR 0.8', compensateForZoom(req, 1.25), { width: 1800, height: 1125, deviceScaleFactor: 0.8, mobile: false });
+	eq('non-integer products are rounded, CDP wants integers', compensateForZoom({ width: 1000, height: 700, deviceScaleFactor: 1, mobile: true }, 1.1), { width: 1100, height: 770, deviceScaleFactor: 1 / 1.1, mobile: true });
+}
+
 // -------------------------------------------------------------------- cdp
 {
 	section('compactIcon — an inlined favicon dwarfs every other field in a tab listing');

@@ -11,6 +11,45 @@ export interface ConsoleEntry {
 	target?: string;
 	/** Set by CDPManager when aggregating across tabs. */
 	tabId?: string;
+	/** Set on `type: 'exception'` entries when `Runtime.exceptionThrown` carried a script location. */
+	url?: string;
+	lineNumber?: number;
+	columnNumber?: number;
+}
+
+/**
+ * Map `Runtime.exceptionThrown`'s params to a `ConsoleEntry`. A pure function
+ * (no `this`, no CDP call) so it can be unit tested without a live tab —
+ * `now` is a parameter rather than `Date.now()` for the same reason.
+ *
+ * `exceptionDetails.exception.description` is preferred when it says more
+ * than the class name: for an Error it carries the message plus stack trace,
+ * which is what makes an uncaught-exception entry actually useful (vs. the
+ * bare "Uncaught" `text` field). A thrown plain object describes itself as
+ * just "Object", so there `text` + description ("Uncaught Object") keeps the
+ * marker; `throw "a string"` has no description and falls back to `.value`.
+ */
+export function exceptionToConsoleEntry(params: Record<string, unknown>, now: number): ConsoleEntry {
+	const details = (params.exceptionDetails ?? {}) as {
+		text?: string;
+		url?: string;
+		lineNumber?: number;
+		columnNumber?: number;
+		exception?: { className?: string; description?: string; value?: unknown };
+	};
+	const { description, className, value } = details.exception ?? {};
+	let text: string;
+	if (description && description !== className) {
+		text = description;
+	} else {
+		const detail = description ?? (value !== undefined ? String(value) : undefined);
+		text = detail !== undefined ? `${details.text ?? ''} ${detail}`.trim() : (details.text ?? '');
+	}
+	const entry: ConsoleEntry = { type: 'exception', text, timestamp: now };
+	if (details.url) entry.url = details.url;
+	if (typeof details.lineNumber === 'number') entry.lineNumber = details.lineNumber;
+	if (typeof details.columnNumber === 'number') entry.columnNumber = details.columnNumber;
+	return entry;
 }
 
 export interface NetworkEntry {
@@ -953,6 +992,9 @@ export class CDPTab {
 			case 'Runtime.consoleAPICalled':
 				this.onConsole(params, sessionId);
 				break;
+			case 'Runtime.exceptionThrown':
+				this.onException(params, sessionId);
+				break;
 			case 'Network.requestWillBeSent':
 				this.onNetworkRequest(params, sessionId);
 				break;
@@ -1124,17 +1166,22 @@ export class CDPTab {
 		const text = args
 			? args.map(a => a.value !== undefined ? String(a.value) : a.description ?? '').join(' ')
 			: '';
-		const entry: ConsoleEntry = {
-			type: params.type as string,
-			text,
-			timestamp: Date.now(),
-		};
+		this.pushConsoleEntry({ type: params.type as string, text, timestamp: Date.now() }, sessionId);
+	}
+
+	/** Tag with the originating child target (worker, iframe, …) and append, trimming to the buffer cap. */
+	private pushConsoleEntry(entry: ConsoleEntry, sessionId?: string): void {
 		const target = sessionId ? this.childSessions.get(sessionId)?.type : undefined;
 		if (target) entry.target = target;
 		this.consoleBuffer.push(entry);
 		if (this.consoleBuffer.length > CONSOLE_BUFFER_SIZE) {
 			this.consoleBuffer.shift();
 		}
+	}
+
+	/** An uncaught exception is console-worthy output, just from a different CDP event. */
+	private onException(params: Record<string, unknown>, sessionId?: string): void {
+		this.pushConsoleEntry(exceptionToConsoleEntry(params, Date.now()), sessionId);
 	}
 
 	private onNetworkRequest(params: Record<string, unknown>, sessionId?: string): void {

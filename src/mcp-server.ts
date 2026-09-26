@@ -219,12 +219,39 @@ server.tool(
 // Click
 server.tool(
 	'browser_click',
-	'Click an element by CSS selector',
+	'Click an element by CSS selector, using real mouse input by default (Input.dispatchMouseEvent: move, press, release) — this actually triggers pointer capture, popover light-dismiss, and other pointer-event-driven behavior that a scripted el.click() skips. Scrolls the element into view first. Returns { clicked, x, y, method, covered }; `covered: true` means another element was on top of the click point (a real click still hits it, same as a user\'s would). Pass `script: true` to fall back to the old el.click() behavior — an escape hatch for a zero-size element or one you deliberately want to click through an overlay.',
 	{
 		selector: z.string().describe('CSS selector of the element to click'),
+		script: z.boolean().optional().describe('Click via el.click() in JS instead of real mouse input. Use when the element has no on-screen layout box.'),
 		tabId: z.string().optional().describe(tabIdDescription),
 	},
-	async ({ selector, tabId }) => toMcpResult(await bridgePost('/click', { selector, tabId })),
+	async ({ selector, script, tabId }) => toMcpResult(await bridgePost('/click', { selector, script, tabId })),
+);
+
+// Drag
+server.tool(
+	'browser_drag',
+	'Drag from one point/element to another using real mouse input: press at `from`, move through interpolated intermediate points with the button held, release at `to`. Because the button is genuinely held down across every move, this drives pointer-capture-based drag interactions (sliders, sortable lists, resize handles) that scripted events cannot. Returns { dragged, from: {x,y}, to: {x,y}, steps }.',
+	{
+		from: z.union([z.string(), z.object({ x: z.number(), y: z.number() })]).describe('Drag start: a CSS selector (resolves to its centre, scrolled into view first) or {x, y} in CSS px viewport coordinates.'),
+		to: z.union([z.string(), z.object({ x: z.number(), y: z.number() })]).describe('Drag end: a CSS selector (resolves to its centre) or {x, y} in CSS px viewport coordinates.'),
+		steps: z.number().int().min(1).max(100).optional().describe('Number of intermediate mouse-move steps between from and to. Default 10.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ from, to, steps, tabId }) => toMcpResult(await bridgePost('/drag', { from, to, steps, tabId })),
+);
+
+// Press key
+server.tool(
+	'browser_press_key',
+	'Press a key via real keyboard input (Input.dispatchKeyEvent keyDown + keyUp) — for keys browser_type\'s `submit` shortcut does not cover, such as Escape (closing a popover/dialog) or arrow keys. Accepts Playwright-style key names (Escape, Enter, Tab, Backspace, Delete, ArrowUp/ArrowDown/ArrowLeft/ArrowRight, Home, End, PageUp, PageDown, Space, F1-F12) or any single printable character (a, A, 1, /). Pass `selector` to focus an element first.',
+	{
+		key: z.string().describe('Key name (e.g. Escape, Enter, ArrowUp, F5) or a single printable character.'),
+		modifiers: z.array(z.enum(['Alt', 'Control', 'Meta', 'Shift'])).optional().describe('Modifier keys held during the press.'),
+		selector: z.string().optional().describe('CSS selector of an element to focus before pressing the key. Omit to send the key to whatever already has focus.'),
+		tabId: z.string().optional().describe(tabIdDescription),
+	},
+	async ({ key, modifiers, selector, tabId }) => toMcpResult(await bridgePost('/press', { key, modifiers, selector, tabId })),
 );
 
 // Type
@@ -285,18 +312,19 @@ server.tool(
 // Emulate
 server.tool(
 	'browser_emulate',
-	'Override device metrics (width, height, deviceScaleFactor, mobile, optional userAgent) on the target tab. Setting `mobile:true` also enables touch emulation so `(hover:none)` / `(pointer:coarse)` media queries fire — without that, mobile sites render their desktop fallback even at iPhone dimensions. The override persists on the tab until cleared with `{reset:true}` — call reset before tests that should see the natural viewport, otherwise prior emulation will leak.',
+	'Override device metrics (width, height, deviceScaleFactor, mobile, optional userAgent) and/or `colorScheme` (prefers-color-scheme) on the target tab. width/height (required together) and colorScheme are independent — pass either, both, or neither with reset:true. Setting `mobile:true` also enables touch emulation so `(hover:none)` / `(pointer:coarse)` media queries fire — without that, mobile sites render their desktop fallback even at iPhone dimensions. Overrides persist on the tab until cleared with `{reset:true}` — call reset before tests that should see the natural viewport/scheme, otherwise prior emulation will leak. When colorScheme is passed, the response includes `colorSchemeApplied`: VS Code\'s BrowserTab CDP surface has silently dropped Emulation.* params before, so this tells you whether it actually took rather than just echoing back what was requested.',
 	{
-		width: z.number().int().positive().optional().describe('Viewport width in CSS pixels. Required unless reset is true.'),
-		height: z.number().int().positive().optional().describe('Viewport height in CSS pixels. Required unless reset is true.'),
+		width: z.number().int().positive().optional().describe('Viewport width in CSS pixels. Must be provided together with height.'),
+		height: z.number().int().positive().optional().describe('Viewport height in CSS pixels. Must be provided together with width.'),
 		deviceScaleFactor: z.number().positive().optional().describe('Device pixel ratio (e.g. 2 for Retina, 3 for iPhone Pro). Default 1.'),
 		mobile: z.boolean().optional().describe('Emulate a mobile device (enables touch + mobile media queries). Default false.'),
 		userAgent: z.string().optional().describe('Override the User-Agent string. Recommended when emulating mobile so server-side UA sniffing matches.'),
-		reset: z.boolean().optional().describe('Clear all emulation overrides on this tab. Pass alone — other fields are ignored.'),
+		colorScheme: z.enum(['dark', 'light', 'none']).optional().describe('Emulate prefers-color-scheme. `none` clears the override without touching viewport emulation.'),
+		reset: z.boolean().optional().describe('Clear all emulation overrides (metrics and color scheme) on this tab. Pass alone — other fields are ignored.'),
 		tabId: z.string().optional().describe(tabIdDescription),
 	},
-	async ({ width, height, deviceScaleFactor, mobile, userAgent, reset, tabId }) => {
-		return toMcpResult(await bridgePost('/emulate', { width, height, deviceScaleFactor, mobile, userAgent, reset, tabId }));
+	async ({ width, height, deviceScaleFactor, mobile, userAgent, colorScheme, reset, tabId }) => {
+		return toMcpResult(await bridgePost('/emulate', { width, height, deviceScaleFactor, mobile, userAgent, colorScheme, reset, tabId }));
 	},
 );
 
@@ -432,7 +460,7 @@ server.tool(
 // Console
 server.tool(
 	'browser_console',
-	'Read recent console output (last 200 per tab). Each entry has type, text, timestamp, tabId, and optional target (worker/iframe/service_worker). Omit tabId to aggregate across this session\'s own tabs.',
+	'Read recent console output (last 200 per tab). Each entry has type, text, timestamp, tabId, and optional target (worker/iframe/service_worker). Uncaught exceptions appear as entries with type: "exception" (text carries the message and stack trace when available). Omit tabId to aggregate across this session\'s own tabs.',
 	{
 		limit: z.number().int().min(1).max(200).default(50).describe('Max entries to return'),
 		tabId: z.string().optional().describe('Filter to one tab. Omit to aggregate across this session\'s own tabs.'),

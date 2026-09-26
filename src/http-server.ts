@@ -9,6 +9,8 @@ import { hasProposedBrowserApi, openBrowserTabCount } from './cdp';
 import { allowsAllExistingTabs, enforceTabAccess as runEnforceTabAccess } from './sharing';
 import { decodePng, pixelAt } from './png';
 import { leaseBusyError } from './clients';
+import { clampSteps, interpolate, keyDefinition, modifiersBitmask, SUPPORTED_KEY_NAMES, type Point } from './input';
+import { compensateForZoom, detectZoom, type MetricsProbe, type MetricsRequest } from './emulation';
 
 const DOWNLOAD_BEHAVIORS: ReadonlySet<DownloadBehavior> = new Set(['allow', 'allowAndName', 'deny', 'default']);
 
@@ -385,6 +387,80 @@ export class BridgeServer {
 		return { tab };
 	}
 
+	/**
+	 * Resolve a `/click`/`/drag` target — a CSS selector or an explicit
+	 * `{x, y}` — to a centre point in CSS px, viewport-relative (the coordinate
+	 * space `Input.dispatchMouseEvent` and `document.elementFromPoint` both
+	 * use). A selector is scrolled into view first only if it isn't already:
+	 * an element already on screen keeps its position, so a drag anchored to
+	 * it doesn't jump.
+	 *
+	 * Options: `zeroSizeHint` is appended to the "no layout box" error (`/click`
+	 * uses it to point at `script:true`, which has no equivalent for `/drag`);
+	 * `scroll: false` reads the current position without scrolling, for a
+	 * second endpoint that must not move a first one already resolved;
+	 * `checkCovered` also reports whether another element is on top at the
+	 * centre point, in the same round trip.
+	 */
+	private async resolvePoint(
+		tab: CDPTab,
+		target: unknown,
+		options: { zeroSizeHint?: string; scroll?: boolean; checkCovered?: boolean } = {},
+	): Promise<(Point & { covered?: boolean; inViewport: boolean }) | { error: string }> {
+		if (target && typeof target === 'object') {
+			const x = Number((target as { x?: unknown }).x);
+			const y = Number((target as { y?: unknown }).y);
+			if (!Number.isFinite(x) || !Number.isFinite(y)) {
+				return { error: `Invalid point ${JSON.stringify(target)}: x and y must be finite numbers.` };
+			}
+			return { x, y, inViewport: true };
+		}
+		if (typeof target !== 'string' || !target) {
+			return { error: 'Expected a CSS selector string or {x, y}' };
+		}
+		const selectorJson = JSON.stringify(target);
+		const result = await tab.send('Runtime.evaluate', {
+			expression: `(() => {
+				const sel = ${selectorJson};
+				const el = document.querySelector(sel);
+				if (!el) return { error: 'Element not found: ' + sel };
+				const fits = r => r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight && r.right <= window.innerWidth;
+				if (${options.scroll !== false} && !fits(el.getBoundingClientRect())) el.scrollIntoView({ block: 'center', inline: 'center' });
+				const r = el.getBoundingClientRect();
+				if (!r.width || !r.height) return { zeroSize: true, error: 'Element has no layout box (width or height 0), so it is not rendered: ' + sel };
+				const x = r.left + r.width / 2, y = r.top + r.height / 2;
+				const out = { x, y, inViewport: fits(r) };
+				if (${options.checkCovered === true}) {
+					const top = document.elementFromPoint(x, y);
+					out.covered = top !== null && top !== el && !el.contains(top);
+				}
+				return out;
+			})()`,
+			returnByValue: true,
+			awaitPromise: true,
+		}) as { result: { value?: { x?: number; y?: number; inViewport?: boolean; covered?: boolean; error?: string; zeroSize?: boolean } } };
+		const val = result.result.value;
+		if (!val) return { error: `Failed to resolve selector: ${target}` };
+		if (val.error) return { error: val.error + (val.zeroSize ? options.zeroSizeHint ?? '' : '') };
+		return { x: val.x!, y: val.y!, inViewport: val.inViewport === true, ...(val.covered !== undefined ? { covered: val.covered } : {}) };
+	}
+
+	/** Focus the element a selector names, or explain why not. Shared by `/type` and `/press`. */
+	private async focusSelector(tab: CDPTab, selector: string): Promise<{ error?: string }> {
+		const result = await tab.send('Runtime.evaluate', {
+			expression: `(() => {
+				const sel = ${JSON.stringify(selector)};
+				const el = document.querySelector(sel);
+				if (!el) return { error: 'Element not found: ' + sel };
+				el.focus();
+				return { focused: true };
+			})()`,
+			returnByValue: true,
+			awaitPromise: true,
+		}) as { result: { value?: { error?: string } } };
+		return { error: result.result.value?.error };
+	}
+
 	private setupRoutes(): void {
 		// Fallback-path lease upkeep for EVERY request, reads included: "refreshed
 		// by ANY request it makes" only extends a lease this client already holds
@@ -589,34 +665,168 @@ export class BridgeServer {
 			}
 		});
 
-		// Click
+		// Click. Real mouse input by default (Input.dispatchMouseEvent: move,
+		// press, release) so pointer capture and popover light-dismiss actually
+		// fire — a scripted `el.click()` triggers neither, which is what issue
+		// #21 reported. `script:true` restores the old `el.click()` behaviour
+		// for elements with no on-screen size, or ones deliberately hidden
+		// behind another element the caller wants to click through anyway.
 		this.app.post('/click', existingTab, controls, async (req, res) => {
 			try {
-				const { selector } = req.body;
+				const { selector, script } = req.body;
 				if (!selector) {
 					res.json({ ok: false, error: 'Missing selector' });
 					return;
 				}
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
-				const selectorJson = JSON.stringify(selector);
-				const result = await resolved.tab.send('Runtime.evaluate', {
-					expression: `(() => {
-						const sel = ${selectorJson};
-						const el = document.querySelector(sel);
-						if (!el) return { error: 'Element not found: ' + sel };
-						el.click();
-						return { clicked: true };
-					})()`,
-					returnByValue: true,
-					awaitPromise: true,
-				}) as { result: { value?: { error?: string; clicked?: boolean } } };
-				const val = result.result.value;
-				if (val?.error) {
-					res.json({ ok: false, error: val.error });
+				const tab = resolved.tab;
+
+				if (script) {
+					const selectorJson = JSON.stringify(selector);
+					const result = await tab.send('Runtime.evaluate', {
+						expression: `(() => {
+							const sel = ${selectorJson};
+							const el = document.querySelector(sel);
+							if (!el) return { error: 'Element not found: ' + sel };
+							el.click();
+							return { clicked: true };
+						})()`,
+						returnByValue: true,
+						awaitPromise: true,
+					}) as { result: { value?: { error?: string; clicked?: boolean } } };
+					const val = result.result.value;
+					if (val?.error) {
+						res.json({ ok: false, error: val.error });
+						return;
+					}
+					res.json({ ok: true, data: { ...val, method: 'script' } });
 					return;
 				}
-				res.json({ ok: true, data: val });
+
+				// `covered`: a real click lands on whatever is on top at (x, y),
+				// same as a user's would — this isn't "wrong", but a caller who
+				// expected their selector's element to receive it needs to know
+				// something else was in the way. Checked *before* the click:
+				// afterwards the DOM may have changed (popover opened, overlay
+				// toggled) or the page may be navigating, and an evaluate in a
+				// torn-down context would turn a successful click into a failure.
+				const point = await this.resolvePoint(tab, selector, { zeroSizeHint: ' Pass script:true to click via JS instead.', checkCovered: true });
+				if ('error' in point) { res.json({ ok: false, error: point.error }); return; }
+				const { x, y } = point;
+
+				// `buttons: 1` on the press: pointer-capture libraries gate on
+				// `event.buttons & 1` in pointerdown before calling
+				// setPointerCapture, and CDP defaults it to 0.
+				await tab.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+				await tab.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+				await tab.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+
+				res.json({ ok: true, data: { clicked: true, x, y, method: 'input', covered: point.covered === true } });
+			} catch (err) {
+				res.json({ ok: false, error: String(err) });
+			}
+		});
+
+		// Drag. Real mouse input the whole way: press at `from`, move through
+		// interpolated points with the button held (`buttons: 1`), release at
+		// `to`. Because the button is genuinely down for every intermediate
+		// move, this drives pointer-capture-based drag interactions (sliders,
+		// sortable lists, resize handles) that a synthetic dragstart/drop
+		// sequence — or a scripted value assignment — never triggers.
+		this.app.post('/drag', existingTab, controls, async (req, res) => {
+			try {
+				const { from, to } = req.body;
+				if (from === undefined || from === null || to === undefined || to === null) {
+					res.json({ ok: false, error: 'Missing from or to' });
+					return;
+				}
+				const resolved = this.resolveTab(req);
+				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
+				const tab = resolved.tab;
+
+				const steps = clampSteps(req.body.steps);
+
+				// Resolving a selector may scroll it into view, which moves every
+				// coordinate already computed. So: bring `to` on screen, then
+				// `from` (the press must land exactly), then re-read `to` without
+				// scrolling. If `to` no longer fits, both ends cannot be on screen
+				// at once and a mouse drag cannot reach it — say so rather than
+				// release at a point the page never saw.
+				const toFirst = await this.resolvePoint(tab, to);
+				if ('error' in toFirst) { res.json({ ok: false, error: toFirst.error }); return; }
+				const fromPoint = await this.resolvePoint(tab, from);
+				if ('error' in fromPoint) { res.json({ ok: false, error: fromPoint.error }); return; }
+				const toPoint = await this.resolvePoint(tab, to, { scroll: false });
+				if ('error' in toPoint) { res.json({ ok: false, error: toPoint.error }); return; }
+				if (!toPoint.inViewport) {
+					res.json({ ok: false, error: 'from and to do not fit in the viewport together, so a mouse drag cannot connect them. Enlarge the viewport with /emulate, or drag in shorter hops.' });
+					return;
+				}
+
+				await tab.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: fromPoint.x, y: fromPoint.y, button: 'none' });
+				await tab.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: fromPoint.x, y: fromPoint.y, button: 'left', buttons: 1, clickCount: 1 });
+				for (const point of interpolate(fromPoint, toPoint, steps)) {
+					await tab.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, button: 'left', buttons: 1 });
+				}
+				await tab.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: toPoint.x, y: toPoint.y, button: 'left' });
+
+				res.json({ ok: true, data: { dragged: true, from: { x: fromPoint.x, y: fromPoint.y }, to: { x: toPoint.x, y: toPoint.y }, steps } });
+			} catch (err) {
+				res.json({ ok: false, error: String(err) });
+			}
+		});
+
+		// Press a key via real keyboard input. `/type`'s `submit` already does
+		// this for Enter; this generalises it to Escape (closing a popover/
+		// dialog — issue #21), arrow keys, and anything else a page listens
+		// for on keydown/keyup that `Input.insertText` (used for typing text)
+		// never dispatches at all.
+		this.app.post('/press', existingTab, controls, async (req, res) => {
+			try {
+				const { key, selector } = req.body;
+				if (!key) {
+					res.json({ ok: false, error: 'Missing key' });
+					return;
+				}
+				const resolved = this.resolveTab(req);
+				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
+				const tab = resolved.tab;
+
+				// Validate before focusing: a bad key name must not leave the page
+				// with a moved focus (and whatever that opened) and then error out.
+				const def = keyDefinition(String(key));
+				if (!def) {
+					res.json({ ok: false, error: `Unknown key "${key}". Supported names: ${SUPPORTED_KEY_NAMES.join(', ')}. Any single printable character also works.` });
+					return;
+				}
+				if (selector) {
+					const focus = await this.focusSelector(tab, String(selector));
+					if (focus.error) { res.json({ ok: false, error: focus.error }); return; }
+				}
+
+				const modifierList: string[] = Array.isArray(req.body.modifiers) ? req.body.modifiers : [];
+				const modifierBits = modifiersBitmask(modifierList);
+				// Control/Meta held means this is a shortcut (Ctrl+A, Cmd+K, ...),
+				// not text entry — sending `text` alongside those modifiers would
+				// make the page think the literal character was typed too.
+				const includeText = def.text !== undefined && !modifierList.includes('Control') && !modifierList.includes('Meta');
+
+				const base = {
+					key: def.key,
+					code: def.code,
+					windowsVirtualKeyCode: def.windowsVirtualKeyCode,
+					nativeVirtualKeyCode: def.nativeVirtualKeyCode,
+					modifiers: modifierBits,
+				};
+				await tab.send('Input.dispatchKeyEvent', {
+					type: 'keyDown',
+					...base,
+					...(includeText ? { text: def.text, unmodifiedText: def.unmodifiedText } : {}),
+				});
+				await tab.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+
+				res.json({ ok: true, data: { pressed: key, modifiers: modifierList } });
 			} catch (err) {
 				res.json({ ok: false, error: String(err) });
 			}
@@ -632,31 +842,12 @@ export class BridgeServer {
 				}
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
-				const selectorJson = JSON.stringify(selector);
-				const focusResult = await resolved.tab.send('Runtime.evaluate', {
-					expression: `(() => {
-						const sel = ${selectorJson};
-						const el = document.querySelector(sel);
-						if (!el) return { error: 'Element not found: ' + sel };
-						el.focus();
-						return { focused: true };
-					})()`,
-					returnByValue: true,
-					awaitPromise: true,
-				}) as { result: { value?: { error?: string } } };
-				if (focusResult.result.value?.error) {
-					res.json({ ok: false, error: focusResult.result.value.error });
-					return;
-				}
+				const focus = await this.focusSelector(resolved.tab, String(selector));
+				if (focus.error) { res.json({ ok: false, error: focus.error }); return; }
 				await resolved.tab.send('Input.insertText', { text });
 				if (submit) {
-					const enterKey = {
-						key: 'Enter',
-						code: 'Enter',
-						windowsVirtualKeyCode: 13,
-						nativeVirtualKeyCode: 13,
-					};
-					await resolved.tab.send('Input.dispatchKeyEvent', { type: 'keyDown', text: '\r', unmodifiedText: '\r', ...enterKey });
+					const { text: enterText, unmodifiedText, ...enterKey } = keyDefinition('Enter')!;
+					await resolved.tab.send('Input.dispatchKeyEvent', { type: 'keyDown', text: enterText, unmodifiedText, ...enterKey });
 					await resolved.tab.send('Input.dispatchKeyEvent', { type: 'keyUp', ...enterKey });
 				}
 				res.json({ ok: true, data: { typed: text.length, submitted: Boolean(submit) } });
@@ -828,47 +1019,123 @@ export class BridgeServer {
 			try {
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
-				const { reset, width, height, deviceScaleFactor, mobile, userAgent } = req.body;
+				const tab = resolved.tab;
+				const { reset, width, height, deviceScaleFactor, mobile, userAgent, colorScheme } = req.body;
 				if (reset) {
-					await resolved.tab.send('Emulation.clearDeviceMetricsOverride');
-					await resolved.tab.send('Emulation.setTouchEmulationEnabled', { enabled: false });
-					await resolved.tab.send('Emulation.setUserAgentOverride', { userAgent: '' });
+					await tab.send('Emulation.clearDeviceMetricsOverride');
+					await tab.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+					await tab.send('Emulation.setUserAgentOverride', { userAgent: '' });
+					// Best-effort: older VS Code builds may not implement this CDP
+					// method, and reset should still succeed for the metrics it does support.
+					await tab.send('Emulation.setEmulatedMedia', { features: [] }).catch(() => {});
 					res.json({ ok: true, data: { reset: true } });
 					return;
 				}
-				if (typeof width !== 'number' || typeof height !== 'number') {
-					res.json({ ok: false, error: 'Missing width and height (or pass {reset:true} to clear)' });
+
+				const hasWidth = typeof width === 'number';
+				const hasHeight = typeof height === 'number';
+				if (hasWidth !== hasHeight) {
+					res.json({ ok: false, error: 'width and height must be provided together' });
 					return;
 				}
-				const isMobile = mobile === true;
-				const dpr = typeof deviceScaleFactor === 'number' ? deviceScaleFactor : 1;
-				const params = { width, height, deviceScaleFactor: dpr, mobile: isMobile };
-
-				let path: 'emulation' | 'page' = 'emulation';
-				try {
-					await resolved.tab.send('Emulation.setDeviceMetricsOverride', params);
-				} catch {
-					path = 'page';
+				const hasColorScheme = colorScheme !== undefined && colorScheme !== null;
+				if (!hasWidth && !hasColorScheme) {
+					res.json({ ok: false, error: 'Missing width and height (or pass colorScheme, or {reset:true} to clear)' });
+					return;
 				}
-				if (path === 'emulation') {
-					const probe = await resolved.tab.send('Runtime.evaluate', {
-						expression: 'window.innerWidth',
-						returnByValue: true,
-					}) as { result: { value: number } };
-					if (probe.result.value !== width) {
-						path = 'page';
+				if (!hasWidth) {
+					// These ride along with the metrics override; accepting them
+					// here would silently drop them.
+					const orphaned = ['deviceScaleFactor', 'mobile', 'userAgent'].filter(k => req.body[k] !== undefined);
+					if (orphaned.length > 0) {
+						res.json({ ok: false, error: `${orphaned.join(', ')} require width and height` });
+						return;
 					}
 				}
-				if (path === 'page') {
-					await resolved.tab.send('Page.setDeviceMetricsOverride', params);
+				if (hasColorScheme && !['dark', 'light', 'none'].includes(colorScheme)) {
+					res.json({ ok: false, error: `Invalid colorScheme "${colorScheme}". Expected one of: dark, light, none` });
+					return;
 				}
-				this.emulatePath = path;
 
-				await resolved.tab.send('Emulation.setTouchEmulationEnabled', { enabled: isMobile });
-				if (typeof userAgent === 'string' && userAgent.length > 0) {
-					await resolved.tab.send('Emulation.setUserAgentOverride', { userAgent });
+				const data: Record<string, unknown> = {};
+
+				if (hasWidth) {
+					const isMobile = mobile === true;
+					const dpr = typeof deviceScaleFactor === 'number' ? deviceScaleFactor : 1;
+					const requested: MetricsRequest = { width, height, deviceScaleFactor: dpr, mobile: isMobile };
+					let params = requested;
+					let zoom = 1;
+					const probeMetrics = async (): Promise<MetricsProbe> => {
+						const probe = await tab.send('Runtime.evaluate', {
+							expression: '({ innerWidth: window.innerWidth, devicePixelRatio: window.devicePixelRatio })',
+							returnByValue: true,
+						}) as { result: { value: MetricsProbe } };
+						return probe.result.value;
+					};
+
+					let path: 'emulation' | 'page' = 'emulation';
+					try {
+						await tab.send('Emulation.setDeviceMetricsOverride', { ...params });
+					} catch {
+						path = 'page';
+					}
+					if (path === 'emulation') {
+						let probe = await probeMetrics();
+						// Under browser/window zoom the override is applied in device
+						// pixels (issue #22: 1440 requested, 1152 = 1440/1.25 seen).
+						// The zoom factor is recoverable from the probe, so re-apply
+						// scaled metrics instead of concluding the width was dropped.
+						const detected = detectZoom(requested, probe);
+						if (detected !== undefined) {
+							zoom = detected;
+							params = compensateForZoom(requested, zoom);
+							await tab.send('Emulation.setDeviceMetricsOverride', { ...params });
+							probe = await probeMetrics();
+						}
+						if (probe.innerWidth !== width) {
+							path = 'page';
+						}
+					}
+					if (path === 'page') {
+						await tab.send('Page.setDeviceMetricsOverride', { ...params });
+					}
+					this.emulatePath = path;
+
+					await tab.send('Emulation.setTouchEmulationEnabled', { enabled: isMobile });
+					if (typeof userAgent === 'string' && userAgent.length > 0) {
+						await tab.send('Emulation.setUserAgentOverride', { userAgent });
+					}
+					Object.assign(data, { width, height, deviceScaleFactor: dpr, mobile: isMobile, userAgent: userAgent ?? null, path });
+					if (zoom !== 1) data.zoom = zoom;
 				}
-				res.json({ ok: true, data: { width, height, deviceScaleFactor: dpr, mobile: isMobile, userAgent: userAgent ?? null, path } });
+
+				if (hasColorScheme) {
+					const features = colorScheme === 'none' ? [] : [{ name: 'prefers-color-scheme', value: colorScheme }];
+					data.colorScheme = colorScheme;
+					try {
+						await tab.send('Emulation.setEmulatedMedia', { features });
+					} catch (err) {
+						// The transport may refuse the method outright; the metrics
+						// half of this call still succeeded, so report rather than fail.
+						Object.assign(data, { colorSchemeApplied: false, colorSchemeError: String(err) });
+						res.json({ ok: true, data });
+						return;
+					}
+					// VS Code's BrowserTab CDP surface has silently dropped
+					// Emulation.* params before (see the width/height dance above) —
+					// probe rather than trust the call succeeded. `none` restores
+					// the OS scheme, which we can't know, so there is nothing to
+					// verify against and no `colorSchemeApplied` for it.
+					if (colorScheme !== 'none') {
+						const probe = await tab.send('Runtime.evaluate', {
+							expression: `matchMedia('(prefers-color-scheme: dark)').matches`,
+							returnByValue: true,
+						}) as { result: { value: boolean } };
+						data.colorSchemeApplied = Boolean(probe.result.value) === (colorScheme === 'dark');
+					}
+				}
+
+				res.json({ ok: true, data });
 			} catch (err) {
 				res.json({ ok: false, error: String(err) });
 			}
