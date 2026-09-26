@@ -826,7 +826,18 @@ export class BridgeServer {
 				});
 				await tab.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
 
-				res.json({ ok: true, data: { pressed: key, modifiers: modifierList } });
+				// VS Code's integrated browser (preload-browserView.ts) intercepts
+				// trusted Escape, F-keys and most Ctrl/Cmd/Alt chords at window level:
+				// preventDefault + forward to the workbench as a keybinding. Page
+				// keydown listeners still run first, but browser-native defaults
+				// (popover light-dismiss, <dialog> close on Escape, F5 reload) do
+				// not. Say so, or a caller will conclude the key never arrived.
+				const forwarded = def.key === 'Escape' || /^F\d+$/.test(def.key)
+					|| modifierList.some(m => m === 'Control' || m === 'Meta' || m === 'Alt');
+				const note = forwarded
+					? 'VS Code forwards this key to its own keybindings after the page\'s keydown listeners run: browser-native defaults (popover/dialog close on Escape, F-key actions) do not fire in the integrated browser. Close a popover with browser_eval `el.hidePopover()` or `dialog.requestClose()` instead.'
+					: undefined;
+				res.json({ ok: true, data: { pressed: key, modifiers: modifierList, ...(note ? { note } : {}) } });
 			} catch (err) {
 				res.json({ ok: false, error: String(err) });
 			}

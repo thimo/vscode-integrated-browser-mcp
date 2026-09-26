@@ -244,7 +244,7 @@ server.tool(
 // Press key
 server.tool(
 	'browser_press_key',
-	'Press a key via real keyboard input (Input.dispatchKeyEvent keyDown + keyUp) — for keys browser_type\'s `submit` shortcut does not cover, such as Escape (closing a popover/dialog) or arrow keys. Accepts Playwright-style key names (Escape, Enter, Tab, Backspace, Delete, ArrowUp/ArrowDown/ArrowLeft/ArrowRight, Home, End, PageUp, PageDown, Space, F1-F12) or any single printable character (a, A, 1, /). Pass `selector` to focus an element first.',
+	'Press a key via real keyboard input (Input.dispatchKeyEvent keyDown + keyUp) — for keys browser_type\'s `submit` shortcut does not cover, such as Escape (closing a popover/dialog) or arrow keys. Accepts Playwright-style key names (Escape, Enter, Tab, Backspace, Delete, ArrowUp/ArrowDown/ArrowLeft/ArrowRight, Home, End, PageUp, PageDown, Space, F1-F12) or any single printable character (a, A, 1, /). Pass `selector` to focus an element first. Limitation of the integrated browser itself: VS Code intercepts Escape, F-keys and most Ctrl/Cmd/Alt chords after the page\'s keydown listeners have run, so page JS sees them but browser-native defaults do not fire — Escape does NOT light-dismiss a popover or close a <dialog> here. Use browser_eval with hidePopover() / requestClose() for that; the response carries a `note` when this applies.',
 	{
 		key: z.string().describe('Key name (e.g. Escape, Enter, ArrowUp, F5) or a single printable character.'),
 		modifiers: z.array(z.enum(['Alt', 'Control', 'Meta', 'Shift'])).optional().describe('Modifier keys held during the press.'),
