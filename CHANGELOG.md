@@ -5,7 +5,7 @@ All notable changes to the Integrated Browser MCP extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.8.0] — 2026-10-01
 
 ### Added
 - New `browser_drag` tool and `POST /drag` endpoint: drags from one point/element to another with the mouse button genuinely held down (`Input.dispatchMouseEvent` press → interpolated `mouseMoved` with `buttons:1` → release at the target), so pointer-capture-based drag interactions — sliders, sortable lists, resize handles — actually engage. `from`/`to` accept a CSS selector or `{x, y}`; `steps` (default 10, 1-100) controls how many intermediate moves are dispatched. Context: [#21](https://github.com/thimo/vscode-integrated-browser-mcp/issues/21).
