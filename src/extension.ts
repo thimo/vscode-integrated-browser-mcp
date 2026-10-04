@@ -8,6 +8,7 @@ import { CDPManager, hasProposedBrowserApi } from './cdp';
 import { BridgeServer } from './http-server';
 import { StatusBar } from './status-bar';
 import { registerLanguageModelTools } from './lm-tools';
+import { configureCodexMcp } from './codex';
 
 const MCP_KEY = 'integrated-browser-mcp';
 const STABLE_DIR = path.join(os.homedir(), '.integrated-browser-mcp');
@@ -340,9 +341,10 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
 		// carries the pin instead of the empty env it was registered with.
 		mcpDidChange?.fire();
 
-		// 6. Configure Claude (server already synced above). The VS Code MCP
+		// 6. Configure external clients (server already synced above). The VS Code MCP
 		//    provider is registered once at activation, not here.
 		await configureClaude();
+		await configureCodexMcp(MCP_KEY, STABLE_SERVER, message => log.appendLine(message));
 
 		log.appendLine(`[Bridge] Started successfully on ${actualEndpoint.socketPath ?? `port ${actualEndpoint.port}`}`);
 	} catch (err) {

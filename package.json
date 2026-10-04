@@ -1,7 +1,7 @@
 {
   "name": "integrated-browser-mcp",
   "displayName": "Integrated Browser MCP",
-  "description": "Exposes VS Code's integrated browser to external agents (Claude Code, scripts, curl) via a local HTTP API and MCP server.",
+  "description": "Exposes VS Code's integrated browser to external agents (Claude Code, Codex, scripts, curl) via a local HTTP API and MCP server.",
   "version": "0.8.0",
   "publisher": "thimo",
   "license": "MIT",
@@ -22,6 +22,7 @@
     "browser",
     "claude",
     "claude-code",
+    "codex",
     "automation",
     "cdp",
     "chrome-devtools-protocol",
@@ -301,7 +302,7 @@
     "test": "vscode-test",
     "publish:marketplace": "vsce publish --allow-proposed-apis browser",
     "release": "scripts/release.sh",
-    "test:unit": "node tests/unit.mjs",
+    "test:unit": "node tests/unit.mjs && node tests/codex.mjs",
     "pretest": "npm run package"
   },
   "dependencies": {

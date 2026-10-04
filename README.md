@@ -2,14 +2,14 @@
 
 [![Release](https://img.shields.io/github/v/release/thimo/vscode-integrated-browser-mcp?label=release)](https://github.com/thimo/vscode-integrated-browser-mcp/releases) [![VS Code Marketplace](https://img.shields.io/badge/marketplace-install-blue)](https://marketplace.visualstudio.com/items?itemName=thimo.integrated-browser-mcp)
 
-Exposes VS Code's integrated browser to external agents (Claude Code, scripts, curl) via a local HTTP API and MCP server.
+Exposes VS Code's integrated browser to external agents (Claude Code, Codex, scripts, curl) via a local HTTP API and MCP server.
 
 Every existing browser automation solution targets an external Chrome process. This extension is different: it bridges the browser **already inside VS Code** — with your session cookies, your localhost dev server, your DevTools — to any agent that can speak HTTP or MCP.
 
 ## How it works
 
 ```
-Claude Code / curl / scripts
+Claude Code / Codex / curl / scripts
     │
     │  MCP (stdio) or HTTP
     ▼
@@ -27,7 +27,8 @@ The extension uses VS Code's built-in `editor-browser` and the Chrome DevTools P
    ```
 2. The bridge starts automatically. Agents reach it over a unix socket (named pipe on Windows) at `~/.integrated-browser-mcp/sockets/` — set `integratedBrowserMcp.transport` to `tcp` for the classic `localhost:3788` port instead
 3. For Claude Code: the MCP server is auto-configured in `~/.claude.json` on first activation
-4. The browser launches lazily on the first request — no browser tab until you need one
+4. For Codex: if the Codex CLI is available, the MCP server is added to the Codex configuration
+5. The browser launches lazily on the first request — no browser tab until you need one
 
 ### Usage with Claude Code
 
@@ -49,6 +50,26 @@ The MCP server ships an `instructions` field that conformant clients surface to 
 For browser automation, use the integrated-browser-mcp MCP tools (browser_navigate, browser_screenshot, etc.) — never shell out to `open`/`xdg-open`/`start`.
 ```
 
+### Usage with Codex
+
+Restart a running Codex CLI session after the extension starts. Codex reads MCP servers when a session starts.
+
+Run `codex mcp list` to make sure that `integrated-browser-mcp` is present. Then ask Codex to use `browser_navigate`.
+
+If the extension cannot find the Codex CLI, add the server yourself:
+
+```bash
+codex mcp add integrated-browser-mcp -- node ~/.integrated-browser-mcp/mcp-server.mjs
+```
+
+On Windows, run this command in PowerShell:
+
+```powershell
+codex mcp add integrated-browser-mcp -- node "$HOME\.integrated-browser-mcp\mcp-server.mjs"
+```
+
+The extension leaves an existing Codex entry with this name unchanged.
+
 ### Usage with curl
 
 The bridge listens on a unix socket by default (see [Limitations and trust model](#limitations-and-trust-model) for why):
@@ -66,7 +87,7 @@ See [HTTP API](#http-api) below for the full endpoint list.
 
 ## MCP tools
 
-All interaction tools accept an optional `tabId` parameter. Omit it to target the active tab — each MCP session (one per Claude Code conversation) has its own active tab, so this never lands on another session's page; see [Per-session tab isolation](#per-session-tab-isolation).
+All interaction tools accept an optional `tabId` parameter. Omit it to target the active tab — each MCP session (one per agent conversation) has its own active tab, so this never lands on another session's page; see [Per-session tab isolation](#per-session-tab-isolation).
 
 | Tool | Description |
 |------|-------------|
