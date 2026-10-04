@@ -5,6 +5,13 @@ All notable changes to the Integrated Browser MCP extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Contributed by [@Balestrino](https://github.com/Balestrino) (#23). Thanks!
+
+### Added
+- **Codex CLI is configured automatically.** Codex reads neither the VS Code MCP provider nor `~/.claude.json`, so until now the bridge could be running while Codex had no browser tools. On bridge startup the extension runs `codex mcp list --json` and, if no `integrated-browser-mcp` entry exists, registers the bundled MCP server with `codex mcp add`. An existing entry with that name is left untouched. If the `codex` binary can't be found, this is logged and skipped; the README has the manual command, including a PowerShell variant for Windows, where automatic registration with an npm `codex.cmd` install is not verified. Restart a running Codex session to pick up the new server.
+
 ## [0.8.0] — 2026-10-01
 
 ### Added
