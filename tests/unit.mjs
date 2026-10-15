@@ -381,7 +381,7 @@ const section = name => console.log(`\n${name}`);
 // -------------------------------------------------------------- instances
 {
 	section('instance selection — which VS Code window a call is routed to');
-	const { selectInstance, resolveTarget, foreignWindowNote, readInstances } = await load('src/instances.ts');
+	const { selectInstance, isInsideWorkspace, resolveTarget, foreignWindowNote, readInstances } = await load('src/instances.ts');
 	const inst = (workspace, extra = {}) => ({ workspace, pid: 1, startedAt: '2026-01-01T00:00:00.000Z', port: 3788, ...extra });
 
 	const natrium = inst('/Users/x/src/electrolyte-natrium', { port: 3792, startedAt: '2026-08-18T10:01:00.000Z' });
@@ -400,17 +400,57 @@ const section = name => console.log(`\n${name}`);
 	eq('matches on a path boundary', selectInstance([natrium], '/Users/x/src/electrolyte-natrium-old').match, 'fallback');
 	eq('nothing registered at all', selectInstance([], '/Users/x/src').instance, null);
 
-	// The bug this fix addresses: VS Code stores `uri.fsPath`, which lowercases
-	// the Windows drive letter, while a shell's cwd uppercases it. Folding only
-	// helps on a case-insensitive filesystem, so the expectation follows the host.
-	const expectedFold = process.platform === 'win32' || process.platform === 'darwin' ? 'cwd' : 'fallback';
-	eq('a case-only difference matches on a case-insensitive filesystem',
-		selectInstance([inst('d:\\Projects\\app', { port: 3795 })], 'D:\\Projects\\app').match, expectedFold);
+	// Path rules are injected so Windows and case-sensitive POSIX both run on
+	// every host. `realpath` is a fake symlink table; anything else "does not exist".
+	const noFs = p => { throw new Error(`ENOENT ${p}`); };
+	const win = { path: path.win32, caseInsensitive: true, realpath: noFs };
+	const posixCs = { path: path.posix, caseInsensitive: false, realpath: noFs };
+	// Existing paths → their real path; `/link/app` and `/tmp` are symlinks.
+	const disk = { '/': '/', '/link/app': '/real/app', '/real/app': '/real/app', '/tmp/proj': '/private/tmp/proj', '/private/tmp/proj': '/private/tmp/proj' };
+	const posixLinked = { path: path.posix, caseInsensitive: false, realpath: p => { if (disk[p]) return disk[p]; throw new Error('ENOENT'); } };
+	const macLike = { ...posixLinked, caseInsensitive: true };
+
+	// The bug PR #24 addresses: VS Code stores `uri.fsPath`, which lowercases
+	// the Windows drive letter, while a shell's cwd uppercases it.
+	eq('a drive-letter case difference matches on Windows',
+		selectInstance([inst('d:\\Projects\\app', { port: 3795 })], 'D:\\Projects\\app\\src', win).match, 'cwd');
+	eq('but not on a case-sensitive volume',
+		selectInstance([inst('/x/Foo', { port: 3795 })], '/x/foo', posixCs).match, 'fallback');
 	// Exact match must win before folding, so a case-sensitive volume's two
 	// directories that differ only by case stay distinct.
 	eq('an exact-case match beats a folded one',
 		selectInstance([inst('D:\\x\\Foo', { port: 3801, startedAt: '2026-01-02T00:00:00.000Z' }),
-			inst('D:\\x\\foo', { port: 3802, startedAt: '2026-01-01T00:00:00.000Z' })], 'D:\\x\\foo').instance.port, 3802);
+			inst('D:\\x\\foo', { port: 3802, startedAt: '2026-01-01T00:00:00.000Z' })], 'D:\\x\\foo', win).instance.port, 3802);
+	eq('a drive-root workspace contains its subfolders',
+		selectInstance([inst('C:\\', { port: 3796 })], 'C:\\work', win).match, 'cwd');
+	eq('a POSIX root workspace contains its subfolders',
+		selectInstance([inst('/', { port: 3796 })], '/Users/x', posixCs).match, 'cwd');
+	eq('a workspace opened through a symlink matches the real cwd',
+		selectInstance([inst('/link/app', { port: 3797 })], '/real/app/src', posixLinked).match, 'cwd');
+	eq('a non-string workspace is skipped, not thrown on',
+		selectInstance([inst({}, { port: 3798 }), inst('/x/app', { port: 3799 })], '/x/app', posixCs).instance.port, 3799);
+
+	// isInsideWorkspace: the outputPath / download-path scope check.
+	eq('outputPath with the other drive-letter case is inside',
+		isInsideWorkspace('D:\\Projects\\app\\tmp\\out.md', 'd:\\Projects\\app', win), true);
+	eq('a prefix-sharing sibling is outside',
+		isInsideWorkspace('d:\\Projects\\app-old\\out.md', 'd:\\Projects\\app', win), false);
+	eq('case is not folded on a case-sensitive volume',
+		isInsideWorkspace('/x/APP/out.md', '/x/app', posixCs), false);
+	eq('a new file under a symlinked workspace, as given',
+		isInsideWorkspace('/link/app/tmp/new.md', '/link/app', posixLinked), true);
+	eq('a new file under a symlinked workspace, by its real path',
+		isInsideWorkspace('/real/app/tmp/new.md', '/link/app', posixLinked), true);
+	eq('a new file through a symlinked parent of a real-path workspace',
+		isInsideWorkspace('/tmp/proj/out.md', '/private/tmp/proj', posixLinked), true);
+	eq('.. cannot escape the workspace',
+		isInsideWorkspace('/x/app/../secret', '/x/app', posixCs), false);
+	// Folding is a guess (a macOS volume can be case-sensitive), fine for picking
+	// a window but not for a write scope: only the drive letter is folded.
+	eq('scope check does not fold case even on a case-insensitive host',
+		isInsideWorkspace('/real/APP/out.md', '/real/app', macLike), false);
+	eq('nor beyond the drive letter on Windows',
+		isInsideWorkspace('D:\\Projects\\APP\\out.md', 'd:\\Projects\\app', win), false);
 
 	// resolveTarget: env pin wins, and still names the window it points at.
 	const pinned = { BROWSER_BRIDGE_SOCKET: '/tmp/a.sock' };
@@ -440,8 +480,10 @@ const section = name => console.log(`\n${name}`);
 	fs.writeFileSync(path.join(dir, 'live.json'), JSON.stringify(inst('/Users/x/live', { pid: 100 })));
 	fs.writeFileSync(path.join(dir, 'dead.json'), JSON.stringify(inst('/Users/x/dead', { pid: 200 })));
 	fs.writeFileSync(path.join(dir, 'corrupt.json'), '{ not json');
+	fs.writeFileSync(path.join(dir, 'odd.json'), JSON.stringify(inst({}, { pid: 101 })));
 	fs.writeFileSync(path.join(dir, 'ignore.txt'), 'not an instance file');
 	eq('skips dead and corrupt instances', readInstances(dir, pid => pid === 100).map(i => i.workspace), ['/Users/x/live']);
+	eq('a non-string workspace becomes "no workspace"', readInstances(dir, pid => pid === 101).map(i => i.workspace), ['']);
 	eq('missing dir is not an error', readInstances(path.join(dir, 'nope')), []);
 	fs.rmSync(dir, { recursive: true, force: true });
 }

@@ -68,6 +68,9 @@ export function readInstances(dir: string = INSTANCES_DIR, alive: (pid: number) 
 			try {
 				const data = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8')) as Instance;
 				if (!alive(data.pid)) continue; // window is gone; its file has not been swept yet
+				// Unvalidated JSON: a non-string workspace would throw in every path
+				// call downstream. Keep the bridge reachable, as a window without one.
+				if (typeof data.workspace !== 'string') data.workspace = '';
 				instances.push(data);
 			} catch {
 				// Skip corrupt files
@@ -79,27 +82,77 @@ export function readInstances(dir: string = INSTANCES_DIR, alive: (pid: number) 
 	return instances;
 }
 
-// Windows and (default) macOS filesystems are case-insensitive; Linux is not.
-const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+/**
+ * How paths compare on this host. A parameter rather than a module constant so
+ * the tests can run the Windows rules (drive letters, `\`, folded case) on any
+ * OS instead of only on the one CI happens to use.
+ */
+export interface PathRules {
+	path: path.PlatformPath;
+	/** Windows and (default) macOS filesystems are case-insensitive; Linux is not. A guess — so window selection only. */
+	caseInsensitive: boolean;
+	/** Follow symlinks; throws when the path does not exist. */
+	realpath: (p: string) => string;
+}
+
+const NATIVE: PathRules = {
+	path,
+	caseInsensitive: process.platform === 'win32' || process.platform === 'darwin',
+	realpath: p => fs.realpathSync.native(p),
+};
+
+/** Newest `startedAt` first. */
+const newestFirst = (a: Instance, b: Instance) => (b.startedAt ?? '').localeCompare(a.startedAt ?? '');
+
+/**
+ * Real path of `p`, or — for a file not written yet — of its deepest existing
+ * ancestor with the rest re-appended, so `/tmp/new.md` still becomes
+ * `/private/tmp/new.md` on macOS.
+ */
+function realpathOfExisting(p: string, rules: PathRules): string {
+	const rest: string[] = [];
+	for (let cur = p; ;) {
+		try {
+			return rules.path.join(rules.realpath(cur), ...rest);
+		} catch {
+			const parent = rules.path.dirname(cur);
+			if (parent === cur) return p; // nothing exists, not even the root
+			rest.unshift(rules.path.basename(cur));
+			cur = parent;
+		}
+	}
+}
 
 /**
  * Canonical form for matching only — never written back or displayed. `cwd` is
  * the filesystem's real path, while VS Code stores `uri.fsPath`, which
- * lowercases the Windows drive letter; on a case-insensitive filesystem that
- * alone makes an exact compare miss the very workspace it came from. Resolve
- * separators/`..`, follow symlinks where the path still exists, and drop a
- * trailing separator so `ws + path.sep` cannot double up on a drive root. Case
- * is preserved; folding happens at comparison time so exact matches can win.
+ * lowercases the Windows drive letter — never meaningful, so it is always
+ * uppercased. Resolve separators/`..` and, with `follow`, symlinks. Any other
+ * case is preserved; selectInstance folds it as a fallback.
  */
-function comparablePath(p: string): string {
-	let out = path.resolve(p);
-	try { out = fs.realpathSync.native(out); } catch { /* gone/unreadable: keep resolve() */ }
-	return out.length > 1 && out.endsWith(path.sep) ? out.slice(0, -1) : out;
+function comparablePath(p: string, rules: PathRules, follow = true): string {
+	let out = rules.path.resolve(p);
+	if (follow) out = realpathOfExisting(out, rules);
+	return rules.path.sep === '\\' ? out.replace(/^[a-z](?=:)/, c => c.toUpperCase()) : out;
 }
 
 /** True when `ws` is `target` itself or a parent of it, on a path boundary. */
-function onPathBoundary(target: string, ws: string): boolean {
-	return target === ws || target.startsWith(ws + path.sep);
+function onPathBoundary(target: string, ws: string, sep: string): boolean {
+	// A root (`/`, `C:\`) keeps its separator, so it is already the prefix.
+	return target === ws || target.startsWith(ws.endsWith(sep) ? ws : ws + sep);
+}
+
+/**
+ * Whether `target` lies inside `workspace` — the outputPath / download-path
+ * scope check — so a path built from the caller's cwd is not rejected for a
+ * drive letter's case or a symlinked workspace. Accepted when inside either as
+ * given or with symlinks resolved. Unlike window selection, case is never
+ * folded beyond the drive letter: a wrong guess here would write outside the
+ * workspace on a case-sensitive volume, not merely pick the wrong window.
+ */
+export function isInsideWorkspace(target: string, workspace: string, rules: PathRules = NATIVE): boolean {
+	return [false, true].some(follow =>
+		onPathBoundary(comparablePath(target, rules, follow), comparablePath(workspace, rules, follow), rules.path.sep));
 }
 
 /**
@@ -109,29 +162,27 @@ function onPathBoundary(target: string, ws: string): boolean {
  * all, and what quietly drives an unrelated browser when several are open.
  * The `match` is returned so callers can say which of the two happened.
  */
-export function selectInstance(instances: Instance[], cwd: string): { instance: Instance | null; match: 'cwd' | 'fallback' | 'default' } {
-	const target = comparablePath(cwd);
+export function selectInstance(instances: Instance[], cwd: string, rules: PathRules = NATIVE): { instance: Instance | null; match: 'cwd' | 'fallback' | 'default' } {
+	const target = comparablePath(cwd, rules);
 	// Deepest workspace first so a nested one wins; newest first breaks a tie so
 	// two windows on the same workspace resolve identically per call, instead of
-	// following readdir order.
+	// following readdir order. Instance files are unvalidated JSON: a non-string
+	// workspace is skipped rather than allowed to throw out of every call.
 	const ranked = instances
-		.filter(i => i.workspace)
-		.map(i => ({ inst: i, ws: comparablePath(i.workspace) }))
-		.sort((a, b) => (b.ws.length - a.ws.length) || (b.inst.startedAt ?? '').localeCompare(a.inst.startedAt ?? ''));
+		.filter(i => typeof i.workspace === 'string' && i.workspace)
+		.map(i => ({ inst: i, ws: comparablePath(i.workspace, rules) }))
+		.sort((a, b) => (b.ws.length - a.ws.length) || newestFirst(a.inst, b.inst));
 	// Exact match first (deepest, then newest). Folding case is a fallback, so a
 	// case-sensitive volume whose directories differ only by case is not forced
 	// into a case-insensitive false positive while an exact match exists.
-	for (const { inst, ws } of ranked) {
-		// Match on a path boundary: /foo/bar must not match /foo/bar-baz.
-		if (onPathBoundary(target, ws)) return { instance: inst, match: 'cwd' };
-	}
-	if (CASE_INSENSITIVE_FS) {
-		const folded = target.toLowerCase();
+	// Match on a path boundary: /foo/bar must not match /foo/bar-baz.
+	for (const fold of rules.caseInsensitive ? [false, true] : [false]) {
+		const t = fold ? target.toLowerCase() : target;
 		for (const { inst, ws } of ranked) {
-			if (onPathBoundary(folded, ws.toLowerCase())) return { instance: inst, match: 'cwd' };
+			if (onPathBoundary(t, fold ? ws.toLowerCase() : ws, rules.path.sep)) return { instance: inst, match: 'cwd' };
 		}
 	}
-	const byAge = [...instances].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+	const byAge = [...instances].sort(newestFirst);
 	if (byAge.length > 0) return { instance: byAge[0], match: 'fallback' };
 	return { instance: null, match: 'default' };
 }

@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
 import * as crypto from 'crypto';
-import { describeEndpoint, foreignWindowNote, readInstances, resolveTarget } from './instances';
+import { describeEndpoint, foreignWindowNote, isInsideWorkspace, readInstances, resolveTarget } from './instances';
 import type { Instance, Resolution } from './instances';
 
 // Replaced at build time by esbuild's `define` (see esbuild.js). Keeps
@@ -365,7 +365,7 @@ server.tool(
 	'Extract page content as markdown. Walks the DOM in-page (~80 lines of pure JS, no Readability/Turndown, no deps). Headings → `#`, links → `[text](url)`, code → backticks, pre → fenced blocks, lists → `-` / `1.`, blockquotes → `>`, images → `![alt](src)`. By default scopes to `<main>` if present, else `<body>`; pass `selector` to scope elsewhere. Useful for letting an agent read a doc page without dumping the entire DOM (browser_dom is much heavier). Lightweight extractor, not Turndown — output may include layout artifacts on heavily designed sites; for those use browser_dom + your own post-processing. Pass `outputPath` to write the markdown to disk and return only `Saved N bytes to <path>` — the path is scoped to the open workspace folder (relative paths resolve against it; absolute paths must live inside it). Useful for bulk archival where the body would otherwise flow through the agent\'s context.',
 	{
 		selector: z.string().optional().describe('CSS selector to scope extraction to (e.g. "article", "#content"). Default: "main" if present, else body.'),
-		outputPath: z.string().optional().describe('Path (absolute or workspace-relative) to write the markdown to. Resolved against the open workspace folder; the resolved path must live inside it. Parent directories are created if missing; existing files are overwritten. When set, the tool returns a short "Saved N bytes to <path>" confirmation instead of the markdown body — keeps the content out of the agent\'s context for archival jobs. Symlinks inside the workspace that escape it are not followed; don\'t enable in workspaces with hostile symlinks.'),
+		outputPath: z.string().optional().describe('Path (absolute or workspace-relative) to write the markdown to. Resolved against the open workspace folder; the resolved path must live inside it. Parent directories are created if missing; existing files are overwritten. When set, the tool returns a short "Saved N bytes to <path>" confirmation instead of the markdown body — keeps the content out of the agent\'s context for archival jobs. A path counts as inside when it is inside either as given or with symlinks resolved, so a symlink inside the workspace that points out of it is still written through; don\'t use in workspaces with hostile symlinks.'),
 		tabId: z.string().optional().describe(tabIdDescription),
 	},
 	async ({ selector, outputPath, tabId }) => {
@@ -380,9 +380,9 @@ server.tool(
 		if (outputPath !== undefined) {
 			// Scope outputPath to the bound workspace folder. Relative paths
 			// resolve against the workspace; absolute paths must live inside
-			// it. Symlinks are not followed — `fs.realpath` per write would
-			// add cost for a low-probability case in a workspace the user
-			// controls; documented above instead.
+			// it, allowing for drive-letter case and symlinks (isInsideWorkspace).
+			// A symlink inside the workspace that escapes it is still accepted —
+			// documented above instead.
 			const instance = discoverInstance();
 			if (!instance?.workspace) {
 				return { content: [{ type: 'text' as const, text: `Error: outputPath requires an open workspace folder` }], isError: true };
@@ -391,7 +391,7 @@ server.tool(
 			const resolved = path.isAbsolute(outputPath)
 				? path.resolve(outputPath)
 				: path.resolve(workspace, outputPath);
-			if (resolved !== workspace && !resolved.startsWith(workspace + path.sep)) {
+			if (!isInsideWorkspace(resolved, workspace)) {
 				return { content: [{ type: 'text' as const, text: `Error: outputPath must be inside the workspace (${workspace}); got ${resolved}` }], isError: true };
 			}
 			const body = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
@@ -522,7 +522,7 @@ server.tool(
 			resolvedPath = path.isAbsolute(inputPath)
 				? path.resolve(inputPath)
 				: path.resolve(workspace, inputPath);
-			if (resolvedPath !== workspace && !resolvedPath.startsWith(workspace + path.sep)) {
+			if (!isInsideWorkspace(resolvedPath, workspace)) {
 				return { content: [{ type: 'text' as const, text: `Error: download path must be inside the workspace (${workspace}); got ${resolvedPath}` }], isError: true };
 			}
 		}
