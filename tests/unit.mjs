@@ -400,6 +400,18 @@ const section = name => console.log(`\n${name}`);
 	eq('matches on a path boundary', selectInstance([natrium], '/Users/x/src/electrolyte-natrium-old').match, 'fallback');
 	eq('nothing registered at all', selectInstance([], '/Users/x/src').instance, null);
 
+	// The bug this fix addresses: VS Code stores `uri.fsPath`, which lowercases
+	// the Windows drive letter, while a shell's cwd uppercases it. Folding only
+	// helps on a case-insensitive filesystem, so the expectation follows the host.
+	const expectedFold = process.platform === 'win32' || process.platform === 'darwin' ? 'cwd' : 'fallback';
+	eq('a case-only difference matches on a case-insensitive filesystem',
+		selectInstance([inst('d:\\Projects\\app', { port: 3795 })], 'D:\\Projects\\app').match, expectedFold);
+	// Exact match must win before folding, so a case-sensitive volume's two
+	// directories that differ only by case stay distinct.
+	eq('an exact-case match beats a folded one',
+		selectInstance([inst('D:\\x\\Foo', { port: 3801, startedAt: '2026-01-02T00:00:00.000Z' }),
+			inst('D:\\x\\foo', { port: 3802, startedAt: '2026-01-01T00:00:00.000Z' })], 'D:\\x\\foo').instance.port, 3802);
+
 	// resolveTarget: env pin wins, and still names the window it points at.
 	const pinned = { BROWSER_BRIDGE_SOCKET: '/tmp/a.sock' };
 	const socketInst = inst('/Users/x/src/pottagold', { port: undefined, socketPath: '/tmp/a.sock' });

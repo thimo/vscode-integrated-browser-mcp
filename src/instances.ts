@@ -79,6 +79,29 @@ export function readInstances(dir: string = INSTANCES_DIR, alive: (pid: number) 
 	return instances;
 }
 
+// Windows and (default) macOS filesystems are case-insensitive; Linux is not.
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+
+/**
+ * Canonical form for matching only — never written back or displayed. `cwd` is
+ * the filesystem's real path, while VS Code stores `uri.fsPath`, which
+ * lowercases the Windows drive letter; on a case-insensitive filesystem that
+ * alone makes an exact compare miss the very workspace it came from. Resolve
+ * separators/`..`, follow symlinks where the path still exists, and drop a
+ * trailing separator so `ws + path.sep` cannot double up on a drive root. Case
+ * is preserved; folding happens at comparison time so exact matches can win.
+ */
+function comparablePath(p: string): string {
+	let out = path.resolve(p);
+	try { out = fs.realpathSync.native(out); } catch { /* gone/unreadable: keep resolve() */ }
+	return out.length > 1 && out.endsWith(path.sep) ? out.slice(0, -1) : out;
+}
+
+/** True when `ws` is `target` itself or a parent of it, on a path boundary. */
+function onPathBoundary(target: string, ws: string): boolean {
+	return target === ws || target.startsWith(ws + path.sep);
+}
+
 /**
  * Pick the window a caller in `cwd` most likely means: the deepest registered
  * workspace containing it. Failing that, the most recently started window —
@@ -87,13 +110,25 @@ export function readInstances(dir: string = INSTANCES_DIR, alive: (pid: number) 
  * The `match` is returned so callers can say which of the two happened.
  */
 export function selectInstance(instances: Instance[], cwd: string): { instance: Instance | null; match: 'cwd' | 'fallback' | 'default' } {
-	// Deepest path first, so a workspace nested inside another one wins.
-	const byDepth = [...instances].sort((a, b) => (b.workspace ?? '').length - (a.workspace ?? '').length);
-	for (const inst of byDepth) {
-		if (!inst.workspace) continue;
+	const target = comparablePath(cwd);
+	// Deepest workspace first so a nested one wins; newest first breaks a tie so
+	// two windows on the same workspace resolve identically per call, instead of
+	// following readdir order.
+	const ranked = instances
+		.filter(i => i.workspace)
+		.map(i => ({ inst: i, ws: comparablePath(i.workspace) }))
+		.sort((a, b) => (b.ws.length - a.ws.length) || (b.inst.startedAt ?? '').localeCompare(a.inst.startedAt ?? ''));
+	// Exact match first (deepest, then newest). Folding case is a fallback, so a
+	// case-sensitive volume whose directories differ only by case is not forced
+	// into a case-insensitive false positive while an exact match exists.
+	for (const { inst, ws } of ranked) {
 		// Match on a path boundary: /foo/bar must not match /foo/bar-baz.
-		if (cwd === inst.workspace || cwd.startsWith(inst.workspace + path.sep)) {
-			return { instance: inst, match: 'cwd' };
+		if (onPathBoundary(target, ws)) return { instance: inst, match: 'cwd' };
+	}
+	if (CASE_INSENSITIVE_FS) {
+		const folded = target.toLowerCase();
+		for (const { inst, ws } of ranked) {
+			if (onPathBoundary(folded, ws.toLowerCase())) return { instance: inst, match: 'cwd' };
 		}
 	}
 	const byAge = [...instances].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
