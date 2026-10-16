@@ -5,6 +5,13 @@ All notable changes to the Integrated Browser MCP extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Contributed by [@tianlang0704](https://github.com/tianlang0704) (#24), including the Windows verification. Thanks!
+
+### Fixed
+- **Window selection and workspace-scoped paths now match a workspace by real path and with a case-insensitive drive letter.** The bundled MCP server picks the VS Code window whose workspace contains its working directory by comparing path strings. Node reports the Windows drive letter in uppercase (`D:\…`) while VS Code stores the workspace with it lowercased (`d:\…`), and a workspace opened through a symlink (`/tmp` → `/private/tmp` on macOS) never string-matched either. With two windows open that compare failed and the server silently fell back to the newest window, driving a browser in the wrong one. The same compare guards `outputPath` on `browser_markdown` and the directory of `browser_download_set`, so an absolute path built from the caller's cwd was rejected as outside the workspace for the same reason. Both now resolve symlinks and normalise the drive letter before comparing; on a case-insensitive volume a window is also matched by folded case as a fallback. The write-scope check does not guess at case beyond the drive letter for paths that do not exist yet; an existing folder passes under any casing because its real path is compared, which is the same folder. Context: [#24](https://github.com/thimo/vscode-integrated-browser-mcp/pull/24).
+
 ## [0.9.0] — 2026-10-04
 
 Contributed by [@Balestrino](https://github.com/Balestrino) (#23). Thanks!
