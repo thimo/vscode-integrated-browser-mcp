@@ -146,9 +146,12 @@ function onPathBoundary(target: string, ws: string, sep: string): boolean {
  * Whether `target` lies inside `workspace` — the outputPath / download-path
  * scope check — so a path built from the caller's cwd is not rejected for a
  * drive letter's case or a symlinked workspace. Accepted when inside either as
- * given or with symlinks resolved. Unlike window selection, case is never
- * folded beyond the drive letter: a wrong guess here would write outside the
- * workspace on a case-sensitive volume, not merely pick the wrong window.
+ * given or with symlinks resolved. Unlike window selection, this never guesses
+ * at case beyond the drive letter: a wrong guess here would write outside the
+ * workspace on a case-sensitive volume, not merely pick the wrong window. A
+ * case variant of an *existing* folder on a case-insensitive volume still
+ * passes, because realpath returns its on-disk spelling — same folder, so
+ * that is correct; only components that do not exist yet are compared as-is.
  */
 export function isInsideWorkspace(target: string, workspace: string, rules: PathRules = NATIVE): boolean {
 	return [false, true].some(follow =>

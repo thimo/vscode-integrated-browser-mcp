@@ -446,11 +446,17 @@ const section = name => console.log(`\n${name}`);
 	eq('.. cannot escape the workspace',
 		isInsideWorkspace('/x/app/../secret', '/x/app', posixCs), false);
 	// Folding is a guess (a macOS volume can be case-sensitive), fine for picking
-	// a window but not for a write scope: only the drive letter is folded.
-	eq('scope check does not fold case even on a case-insensitive host',
+	// a window but not for a write scope: only the drive letter is folded. That
+	// holds for components that do not exist yet; an existing folder is matched
+	// by its real path, which on a case-insensitive volume carries the on-disk
+	// case (fs.realpathSync.native on NTFS) — same folder, so it passes.
+	eq('scope check does not fold case of a new path even on a case-insensitive host',
 		isInsideWorkspace('/real/APP/out.md', '/real/app', macLike), false);
-	eq('nor beyond the drive letter on Windows',
+	eq('nor beyond the drive letter on Windows when the folder does not exist',
 		isInsideWorkspace('D:\\Projects\\APP\\out.md', 'd:\\Projects\\app', win), false);
+	const ntfs = { ...win, realpath: p => { if (/^d:\\projects\\app$/i.test(p)) return 'D:\\Projects\\app'; throw new Error('ENOENT'); } };
+	eq('an existing case-variant folder on Windows matches by its real path',
+		isInsideWorkspace('D:\\Projects\\APP\\out.md', 'd:\\Projects\\app', ntfs), true);
 
 	// resolveTarget: env pin wins, and still names the window it points at.
 	const pinned = { BROWSER_BRIDGE_SOCKET: '/tmp/a.sock' };
