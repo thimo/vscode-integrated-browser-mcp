@@ -40,6 +40,28 @@ function isBrowserSession(session: vscode.DebugSession): boolean {
 		|| session.type === 'chrome';
 }
 
+/**
+ * Browser child sessions seen since activation. Only children carry the CDP
+ * proxy (the root launcher has none), and the debug API cannot enumerate
+ * sessions, so we track them to resolve a focused root to its child.
+ */
+const browserChildSessions = new Set<vscode.DebugSession>();
+
+/**
+ * The active debug session if it is (or is the root of) a browser session,
+ * resolved to the child that carries CDP. Returns undefined for a root whose
+ * child we have not seen — adopting the root would fail requestCDPProxy.
+ */
+function activeBrowserChildSession(): vscode.DebugSession | undefined {
+	const active = vscode.debug.activeDebugSession;
+	if (!active || !isBrowserSession(active)) return undefined;
+	if (active.parentSession) return active;
+	for (const child of browserChildSessions) {
+		if (child.parentSession === active) return child;
+	}
+	return undefined;
+}
+
 function getWorkspacePath(): string {
 	return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 }
@@ -94,8 +116,8 @@ function adoptOpenBrowserTabs(): void {
  * it. `adoptDebugSession` re-checks the setting and returns null if it is off.
  */
 function adoptExistingDebugSession(): void {
-	const session = vscode.debug.activeDebugSession;
-	if (!cdp || cdp.tabCount > 0 || !session || !isBrowserSession(session)) return;
+	const session = activeBrowserChildSession();
+	if (!cdp || cdp.tabCount > 0 || !session) return;
 	cdp.adoptDebugSession(session, false).catch(err => {
 		log.appendLine(`[Bridge] adoptDebugSession failed: ${err}`);
 	});
@@ -134,6 +156,7 @@ export function activate(context: vscode.ExtensionContext) {
 		log,
 		statusBar,
 		vscode.debug.onDidStartDebugSession(session => {
+			if (isBrowserSession(session) && session.parentSession) browserChildSessions.add(session);
 			// Auto-connect to externally launched browser child sessions on the
 			// fallback (websocket) path. Skip root sessions (no CDP), skip if
 			// launchBrowser() is handling it, and skip if we already have tabs.
@@ -146,6 +169,7 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 		}),
 		vscode.debug.onDidTerminateDebugSession(session => {
+			browserChildSessions.delete(session);
 			// On the fallback path, a single debug session drives the single tab.
 			// When that session terminates, close the tab so state matches reality.
 			if (!cdp || cdp.transport !== 'websocket') return;
@@ -327,9 +351,8 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
 
 		if (!proposedApiWired) {
 			// Fallback: if a browser debug session is already active, adopt it.
-			const existingSession = vscode.debug.activeDebugSession && isBrowserSession(vscode.debug.activeDebugSession)
-				? vscode.debug.activeDebugSession
-				: undefined;
+			// Must be the child session: the root launcher has no CDP proxy.
+			const existingSession = activeBrowserChildSession();
 			if (existingSession) {
 				await cdp.adoptDebugSession(existingSession, false);
 			}

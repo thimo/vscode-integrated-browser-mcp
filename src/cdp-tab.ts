@@ -519,7 +519,13 @@ export class CDPTab {
 					this._browserTabSession = null;
 					this.pending.forEach(p => p.reject(new Error('Session closed')));
 					this.pending.clear();
-					if (!this.disposed) this.setState('disconnected');
+					if (!this.disposed) {
+						this.setState('disconnected');
+						// No reconnect on this transport: hand the tab back so the
+						// bridge untracks it and can relaunch instead of reporting
+						// "CDP not connected" forever.
+						this._onGaveUp.fire();
+					}
 				}),
 			);
 			this.log.appendLine(`[CDP:${this.tabId}] BrowserCDPSession ready`);
@@ -534,6 +540,7 @@ export class CDPTab {
 		} catch (err) {
 			this.log.appendLine(`[CDP:${this.tabId}] connectToBrowserTab failed: ${err}`);
 			this.setState('disconnected');
+			if (!this.disposed) this._onGaveUp.fire();
 		}
 	}
 

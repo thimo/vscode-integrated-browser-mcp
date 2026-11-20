@@ -483,6 +483,11 @@ export class CDPManager {
 			}
 			this.registerTab(tab);
 			await tab.connectToBrowserTab(browserTab);
+			// A failed connect fires onGaveUp, which untracks the tab
+			// synchronously. Don't hand back (or activate) a dead tab.
+			if (!this.tabs.has(tab.tabId)) {
+				throw new Error(`CDP connect to browser tab failed (${browserTab.url})`);
+			}
 
 			// No bridge-level ownership handshake: the proposed API is
 			// per-window, so two bridges never see the same tab. The check
@@ -569,7 +574,7 @@ export class CDPManager {
 	private async dropUnreachableTab(tabId: string): Promise<void> {
 		const tab = this.tabs.get(tabId);
 		if (!tab) return;
-		this.log.appendLine(`[Bridge] Dropping ${tabId}: CDP unreachable after repeated reconnects`);
+		this.log.appendLine(`[Bridge] Dropping ${tabId}: CDP unreachable`);
 		const session = tab.bridgeOwned ? tab.debugSession : null;
 		tab.dispose();
 		this.tabSubscriptions.get(tabId)?.dispose();
