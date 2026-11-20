@@ -649,6 +649,49 @@ const section = name => console.log(`\n${name}`);
 	}
 }
 
+// ------------------------------------------------- cdp-tab: event buffering
+{
+	section('CDPTab buffers — redirects and duplicate download events');
+	const { CDPTab } = await load('src/cdp-tab.ts');
+	const newTab = () => new CDPTab('t', { appendLine() {} });
+	// handleEvent is private in TS only; driving it exercises the real routing.
+	const emit = (tab, method, params) => tab.handleEvent(method, params);
+	const request = (requestId, url, redirectResponse) => ({
+		requestId, type: 'Document', request: { method: 'GET', url },
+		...(redirectResponse ? { redirectResponse } : {}),
+	});
+
+	{
+		const tab = newTab();
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'http://x.com/'));
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'https://x.com/', { status: 301, statusText: 'Moved Permanently' }));
+		emit(tab, 'Network.responseReceived', { requestId: 'r1', response: { status: 200, statusText: 'OK' } });
+		eq('each redirect hop gets its own status', tab.network.map(e => [e.url, e.status]), [['http://x.com/', 301], ['https://x.com/', 200]]);
+	}
+
+	{
+		// The first hop is evicted while the second is still in flight: the
+		// eviction must not take the live hop's map slot with it.
+		const tab = newTab();
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'http://x.com/'));
+		for (let i = 0; i < 199; i++) emit(tab, 'Network.requestWillBeSent', request(`f${i}`, `https://x.com/f${i}`));
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'https://x.com/', { status: 302, statusText: 'Found' }));
+		emit(tab, 'Network.responseReceived', { requestId: 'r1', response: { status: 200, statusText: 'OK' } });
+		eq('buffer stays capped', tab.network.length, 200);
+		eq('evicting an old hop keeps the live hop recording', tab.network.at(-1).status, 200);
+	}
+
+	{
+		const tab = newTab();
+		const begin = { guid: 'g1', url: 'https://x.com/a.zip', suggestedFilename: 'a.zip' };
+		emit(tab, 'Page.downloadWillBegin', begin);
+		emit(tab, 'Browser.downloadWillBegin', begin);
+		emit(tab, 'Browser.downloadProgress', { guid: 'g1', state: 'completed', totalBytes: 10, receivedBytes: 10 });
+		eq('Page.* + Browser.* announce one download once', tab.downloads.length, 1);
+		eq('the single entry receives progress', tab.downloads[0].state, 'completed');
+	}
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) {
 	console.log(`${failures} FAILED`);

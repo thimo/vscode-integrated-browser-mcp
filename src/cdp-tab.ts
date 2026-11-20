@@ -1052,6 +1052,8 @@ export class CDPTab {
 	private onDownloadWillBegin(params: Record<string, unknown>): void {
 		const guid = params.guid as string | undefined;
 		if (!guid) return;
+		// Page.* and Browser.* can both announce the same download; keep one.
+		if (this.downloadMap.has(guid)) return;
 		const entry: DownloadEntry = {
 			guid,
 			url: (params.url as string) ?? '',
@@ -1065,7 +1067,7 @@ export class CDPTab {
 		this.downloadBuffer.push(entry);
 		if (this.downloadBuffer.length > DOWNLOAD_BUFFER_SIZE) {
 			const removed = this.downloadBuffer.shift()!;
-			this.downloadMap.delete(removed.guid);
+			if (this.downloadMap.get(removed.guid) === removed) this.downloadMap.delete(removed.guid);
 		}
 	}
 
@@ -1194,6 +1196,18 @@ export class CDPTab {
 	private onNetworkRequest(params: Record<string, unknown>, sessionId?: string): void {
 		const request = params.request as { method: string; url: string } | undefined;
 		if (!request) return;
+		// A redirect reuses the requestId and re-fires requestWillBeSent with the
+		// previous hop's response attached. Close out that hop before the new
+		// entry takes over the map slot, or it never gets a status.
+		const redirect = params.redirectResponse as { status: number; statusText: string } | undefined;
+		if (redirect) {
+			const prev = this.networkMap.get(params.requestId as string);
+			if (prev) {
+				prev.status = redirect.status;
+				prev.statusText = redirect.statusText;
+				prev.responseTimestamp = Date.now();
+			}
+		}
 		const entry: NetworkEntry = {
 			requestId: params.requestId as string,
 			method: request.method,
@@ -1207,7 +1221,9 @@ export class CDPTab {
 		this.networkBuffer.push(entry);
 		if (this.networkBuffer.length > NETWORK_BUFFER_SIZE) {
 			const removed = this.networkBuffer.shift()!;
-			this.networkMap.delete(removed.requestId);
+			// Only drop the map slot if it still points at this entry: a later
+			// redirect hop with the same requestId may own it now.
+			if (this.networkMap.get(removed.requestId) === removed) this.networkMap.delete(removed.requestId);
 		}
 	}
 
