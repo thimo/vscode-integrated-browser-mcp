@@ -141,6 +141,15 @@ export function projectAXNodes(
 	return out;
 }
 
+/** True for a Host header naming loopback (any port). Absent Host = HTTP/1.0 local tool. */
+export function isLoopbackHost(host: string | undefined): boolean {
+	if (host === undefined) return true;
+	const name = host.startsWith('[')
+		? host.slice(0, host.indexOf(']') + 1)
+		: host.replace(/:\d+$/, '');
+	return ['127.0.0.1', 'localhost', '[::1]'].includes(name.toLowerCase());
+}
+
 export class BridgeServer {
 	private app: express.Application;
 	private server: http.Server | null = null;
@@ -158,6 +167,18 @@ export class BridgeServer {
 		this.log = log;
 		this.workspace = workspace;
 		this.app = express();
+		// DNS-rebinding guard. Binding to 127.0.0.1 does not stop a web page
+		// whose hostname was rebound to loopback: to the browser those requests
+		// are same-origin. Legit callers (MCP server, curl, extension host) send
+		// a loopback Host and never an Origin, so require the first and refuse
+		// the second. Runs before body parsing.
+		this.app.use((req, res, next) => {
+			if (req.get('Origin') !== undefined || !isLoopbackHost(req.get('Host'))) {
+				res.status(403).json({ ok: false, error: 'Forbidden: browser-originated or non-loopback request' });
+				return;
+			}
+			next();
+		});
 		this.app.use(express.json());
 		this.setupRoutes();
 	}

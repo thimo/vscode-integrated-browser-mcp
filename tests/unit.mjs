@@ -265,6 +265,24 @@ const section = name => console.log(`\n${name}`);
 	eq('only meaningful nodes survive', project(spa).length, 20);
 }
 
+// ---------------------------------------------------------- http-server: host
+{
+	section('isLoopbackHost — DNS-rebinding guard on the HTTP API');
+	const { isLoopbackHost } = await load('src/http-server.ts');
+
+	eq('127.0.0.1 with port', isLoopbackHost('127.0.0.1:3788'), true);
+	eq('localhost without port (unix-socket clients send this)', isLoopbackHost('localhost'), true);
+	eq('localhost is case-insensitive', isLoopbackHost('LocalHost:3788'), true);
+	eq('IPv6 loopback', isLoopbackHost('[::1]:3788'), true);
+	eq('absent Host (HTTP/1.0)', isLoopbackHost(undefined), true);
+	// A rebound page sends its own hostname, whatever IP it resolved to.
+	eq('a foreign host is refused', isLoopbackHost('evil.com:3788'), false);
+	eq('a loopback-prefixed host is refused', isLoopbackHost('127.0.0.1.evil.com'), false);
+	eq('a localhost-prefixed host is refused', isLoopbackHost('localhost.evil.com:3788'), false);
+	eq('another IPv6 address is refused', isLoopbackHost('[::2]:3788'), false);
+	eq('an empty Host is refused', isLoopbackHost(''), false);
+}
+
 // -------------------------------------------------------------------- png
 {
 	section('decodePng — a wrong un-filter yields plausible but wrong colours');
