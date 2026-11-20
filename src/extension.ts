@@ -9,6 +9,7 @@ import { BridgeServer } from './http-server';
 import { StatusBar } from './status-bar';
 import { registerLanguageModelTools } from './lm-tools';
 import { configureCodexMcp } from './codex';
+import { readClaudeConfig } from './claude-config';
 
 const MCP_KEY = 'integrated-browser-mcp';
 const STABLE_DIR = path.join(os.homedir(), '.integrated-browser-mcp');
@@ -664,12 +665,10 @@ async function syncMcpServer(context: vscode.ExtensionContext): Promise<void> {
 async function configureClaude(): Promise<void> {
 	const claudeSettingsPath = path.join(os.homedir(), '.claude.json');
 	try {
-		let config: Record<string, unknown> = {};
-		try {
-			const raw = await fs.promises.readFile(claudeSettingsPath, 'utf-8');
-			config = JSON.parse(raw);
-		} catch {
-			// File doesn't exist yet
+		const config = await readClaudeConfig(claudeSettingsPath);
+		if (!config) {
+			log.appendLine(`[MCP] Could not read ${claudeSettingsPath} as JSON, leaving it untouched`);
+			return;
 		}
 
 		const mcpServers = (config.mcpServers ?? {}) as Record<string, unknown>;

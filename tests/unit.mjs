@@ -621,6 +621,34 @@ const section = name => console.log(`\n${name}`);
 	eq('names the two ways it frees up', leaseBusyError(0, 0).includes('frees up when that session ends or after 5 minutes idle'), true);
 }
 
+// ------------------------------------------------------------- claude-config
+{
+	section('readClaudeConfig — never treat an unreadable ~/.claude.json as empty');
+	const { readClaudeConfig } = await load('src/claude-config.ts');
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ibm-claude-config-'));
+	const file = name => path.join(dir, name);
+	try {
+		eq('a missing file starts fresh', await readClaudeConfig(file('missing.json')), {});
+
+		fs.writeFileSync(file('ok.json'), JSON.stringify({ projects: { a: 1 }, mcpServers: {} }));
+		eq('a valid file is returned as-is', await readClaudeConfig(file('ok.json')), { projects: { a: 1 }, mcpServers: {} });
+
+		// The failures that used to come back as {} and get written over the
+		// user's real config: Claude Code mid-write, hand-edited, or BOM'd.
+		fs.writeFileSync(file('partial.json'), '{"projects": {"a": 1');
+		eq('a truncated file is refused', await readClaudeConfig(file('partial.json')), null);
+		fs.writeFileSync(file('comma.json'), '{"projects": {},}');
+		eq('a trailing comma is refused', await readClaudeConfig(file('comma.json')), null);
+		fs.writeFileSync(file('bom.json'), '﻿{"projects": {}}');
+		eq('a BOM is refused', await readClaudeConfig(file('bom.json')), null);
+		fs.writeFileSync(file('array.json'), '[]');
+		eq('a non-object top level is refused', await readClaudeConfig(file('array.json')), null);
+		eq('a directory (EISDIR) is refused, not treated as missing', await readClaudeConfig(dir), null);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) {
 	console.log(`${failures} FAILED`);
