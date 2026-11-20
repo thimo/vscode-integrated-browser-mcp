@@ -876,10 +876,14 @@ export class BridgeServer {
 				const resolved = this.resolveTab(req);
 				if (!resolved.tab) { res.json({ ok: false, error: resolved.error }); return; }
 				if (selector) {
-					await resolved.tab.send('Runtime.evaluate', {
-						expression: `document.querySelector(${JSON.stringify(selector)})?.scrollBy(${deltaX}, ${deltaY})`,
+					const result = await resolved.tab.send('Runtime.evaluate', {
+						expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.scrollBy(${deltaX}, ${deltaY}); return true; })()`,
 						returnByValue: true,
-					});
+					}) as { result?: { value?: unknown } };
+					if (result.result?.value !== true) {
+						res.json({ ok: false, error: `Element not found: ${selector}` });
+						return;
+					}
 				} else {
 					await resolved.tab.send('Runtime.evaluate', {
 						expression: `window.scrollBy(${deltaX}, ${deltaY})`,
@@ -1078,7 +1082,13 @@ export class BridgeServer {
 					let zoom = 1;
 					const probeMetrics = async (): Promise<MetricsProbe> => {
 						const probe = await tab.send('Runtime.evaluate', {
-							expression: '({ innerWidth: window.innerWidth, devicePixelRatio: window.devicePixelRatio })',
+							// In mobile mode innerWidth is the *layout* viewport (980 on a
+							// page without <meta name=viewport>), not the emulated width.
+							// The visual viewport scaled back to CSS px is the device
+							// width in both modes, so use that when emulating mobile.
+							expression: isMobile
+								? '(() => { const vv = window.visualViewport; return { innerWidth: vv ? Math.round(vv.width * vv.scale) : window.innerWidth, devicePixelRatio: window.devicePixelRatio }; })()'
+								: '({ innerWidth: window.innerWidth, devicePixelRatio: window.devicePixelRatio })',
 							returnByValue: true,
 						}) as { result: { value: MetricsProbe } };
 						return probe.result.value;
