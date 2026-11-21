@@ -150,6 +150,23 @@ export function isLoopbackHost(host: string | undefined): boolean {
 	return ['127.0.0.1', 'localhost', '[::1]'].includes(name.toLowerCase());
 }
 
+/**
+ * True when a request comes from a web page and must be refused. Legit callers
+ * (MCP server, curl, extension host) send a loopback Host and neither of the
+ * browser-only headers.
+ *  - `Origin`: sent on every cross-origin fetch and on every POST from a page.
+ *  - non-loopback `Host`: a page whose hostname was rebound to loopback. To the
+ *    browser those requests are same-origin, so nothing else gives them away.
+ *  - `Sec-Fetch-Site`: covers what the two above miss, a cross-site GET without
+ *    CORS (an `<img>` or a link aimed at the port) that has no Origin and a
+ *    loopback Host. Only `none` passes: the user typed the URL themselves.
+ */
+export function isBrowserRequest(headers: { origin?: string; host?: string; secFetchSite?: string }): boolean {
+	if (headers.origin !== undefined) return true;
+	if (!isLoopbackHost(headers.host)) return true;
+	return headers.secFetchSite !== undefined && headers.secFetchSite.toLowerCase() !== 'none';
+}
+
 export class BridgeServer {
 	private app: express.Application;
 	private server: http.Server | null = null;
@@ -169,11 +186,10 @@ export class BridgeServer {
 		this.app = express();
 		// DNS-rebinding guard. Binding to 127.0.0.1 does not stop a web page
 		// whose hostname was rebound to loopback: to the browser those requests
-		// are same-origin. Legit callers (MCP server, curl, extension host) send
-		// a loopback Host and never an Origin, so require the first and refuse
-		// the second. Runs before body parsing.
+		// are same-origin. See `isBrowserRequest` for what gives a page away.
+		// Runs before body parsing.
 		this.app.use((req, res, next) => {
-			if (req.get('Origin') !== undefined || !isLoopbackHost(req.get('Host'))) {
+			if (isBrowserRequest({ origin: req.get('Origin'), host: req.get('Host'), secFetchSite: req.get('Sec-Fetch-Site') })) {
 				res.status(403).json({ ok: false, error: 'Forbidden: browser-originated or non-loopback request' });
 				return;
 			}

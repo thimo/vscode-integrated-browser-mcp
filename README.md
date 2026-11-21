@@ -271,6 +271,7 @@ Caveats:
 ## Limitations and trust model
 
 - The bridge listens on a unix socket / named pipe with owner-only permissions by default — nothing is bound to a network interface, no port to scan, and other local users can't connect. On `integratedBrowserMcp.transport: "tcp"` it binds `127.0.0.1` only, with no authentication — reachable by any local process, same trust model as VS Code's built-in terminals.
+- Web pages cannot call the API. A request with an `Origin` header, a `Host` that is not loopback, or a `Sec-Fetch-Site` header other than `none` gets a 403, which also stops a page that reaches the TCP port through DNS rebinding. Local tools such as curl and scripts are unaffected.
 - `/eval` runs arbitrary JavaScript in the open page — same trust model as the DevTools console. Don't pass untrusted input.
 - **Agents can only drive tabs the bridge opened.** Tabs you open yourself are detached and never reach an agent, so installing this does not expose whatever you already had open in the integrated browser. Set `integratedBrowserMcp.allowAllExistingTabs` to `true` when you *do* want an agent to work in your own tabs. Works on every VS Code build.
 - VS Code's page-sharing toggle does not govern this bridge in either mode. Sharing is Copilot's consent gate for its own tools; the proposed `browser` API exposes no sharing state, so share/unshare is invisible here. Revoke by closing the tab or stopping the bridge.

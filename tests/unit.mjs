@@ -283,6 +283,25 @@ const section = name => console.log(`\n${name}`);
 	eq('an empty Host is refused', isLoopbackHost(''), false);
 }
 
+{
+	section('isBrowserRequest — which requests the HTTP API refuses');
+	const { isBrowserRequest } = await load('src/http-server.ts');
+	const host = '127.0.0.1:3788';
+
+	// What the real clients send (measured: http.request over TCP and over the socket).
+	eq('MCP server over TCP passes', isBrowserRequest({ host }), false);
+	eq('MCP server over the unix socket passes', isBrowserRequest({ host: 'localhost' }), false);
+	eq('a URL the user typed in a browser passes', isBrowserRequest({ host, secFetchSite: 'none' }), false);
+
+	eq('any Origin is refused', isBrowserRequest({ host, origin: 'https://evil.com' }), true);
+	eq('an opaque Origin is refused', isBrowserRequest({ host, origin: 'null' }), true);
+	eq('a rebound Host is refused', isBrowserRequest({ host: 'evil.com:3788' }), true);
+	// The gap Origin + Host leave open: <img src="http://127.0.0.1:3788/...">.
+	eq('a cross-site GET without Origin is refused', isBrowserRequest({ host, secFetchSite: 'cross-site' }), true);
+	eq('a same-site GET (a localhost dev page) is refused', isBrowserRequest({ host, secFetchSite: 'same-site' }), true);
+	eq('same-origin is refused too: the bridge serves no pages', isBrowserRequest({ host, secFetchSite: 'same-origin' }), true);
+}
+
 // -------------------------------------------------------------------- png
 {
 	section('decodePng — a wrong un-filter yields plausible but wrong colours');

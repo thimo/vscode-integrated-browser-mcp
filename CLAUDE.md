@@ -142,7 +142,7 @@ Start immediately when VS Code opens — don't wait for a command.
 
 ## Security
 - HTTP server binds to `127.0.0.1` only — never exposed to network
-- Requests with an `Origin` header or a non-loopback `Host` are rejected (DNS-rebinding guard)
+- Requests from a web page are rejected with 403: an `Origin` header, a non-loopback `Host` (DNS rebinding), or a `Sec-Fetch-Site` other than `none`
 - No authentication (same as cdp-bridge — localhost only)
 - Document clearly: `/eval` executes arbitrary JS in whatever page is open
 
