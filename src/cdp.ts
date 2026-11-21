@@ -433,7 +433,15 @@ export class CDPManager {
 			// the default stays in the current group.
 			...(beside ? { viewColumn: vscode.ViewColumn.Beside } : {}),
 		});
-		const tab = await this.adoptBrowserTab(browserTab, makeActive, true, clientId);
+		let tab: CDPTab;
+		try {
+			tab = await this.adoptBrowserTab(browserTab, makeActive, true, clientId);
+		} catch (err) {
+			// The bridge opened this editor tab a moment ago. If it cannot be
+			// driven, close it instead of leaving an untracked blank tab behind.
+			try { await browserTab.close(); } catch { /* already closed */ }
+			throw err;
+		}
 		if (url !== 'about:blank') {
 			await tab.send('Page.navigate', { url });
 			// Don't return until the tab reports the destination. Returning
@@ -510,7 +518,10 @@ export class CDPManager {
 			return tab;
 		})();
 		this.pendingAdoptions.set(browserTab, promise);
-		promise.finally(() => this.pendingAdoptions.delete(browserTab));
+		// `finally` returns a new promise that rejects along with `promise`.
+		// Callers handle the rejection on `promise` itself; this branch only
+		// does the bookkeeping, so swallow its copy.
+		promise.finally(() => this.pendingAdoptions.delete(browserTab)).catch(() => undefined);
 		return promise;
 	}
 
@@ -574,7 +585,7 @@ export class CDPManager {
 	private async dropUnreachableTab(tabId: string): Promise<void> {
 		const tab = this.tabs.get(tabId);
 		if (!tab) return;
-		this.log.appendLine(`[Bridge] Dropping ${tabId}: CDP unreachable`);
+		this.log.appendLine(`[Bridge] Dropping ${tabId}: CDP session closed or unreachable`);
 		const session = tab.bridgeOwned ? tab.debugSession : null;
 		tab.dispose();
 		this.tabSubscriptions.get(tabId)?.dispose();

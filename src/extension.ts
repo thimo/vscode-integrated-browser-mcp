@@ -57,7 +57,7 @@ function activeBrowserChildSession(): vscode.DebugSession | undefined {
 	if (!active || !isBrowserSession(active)) return undefined;
 	if (active.parentSession) return active;
 	for (const child of browserChildSessions) {
-		if (child.parentSession === active) return child;
+		if (child.parentSession?.id === active.id) return child;
 	}
 	return undefined;
 }
