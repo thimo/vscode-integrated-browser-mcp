@@ -5,6 +5,24 @@ All notable changes to the Integrated Browser MCP extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Contributed by [@Dunigan](https://github.com/Dunigan) (#25, #26). Thanks!
+
+### Security
+- **Web pages can no longer call the HTTP API.** Binding to `127.0.0.1` does not stop a web page from reaching a TCP port on the same machine: a page whose hostname is rebound to loopback (DNS rebinding) is same-origin to the browser, and could reach `/eval`, `/navigate` and `/download/set`. The bridge now answers 403 to any request with an `Origin` header, a `Host` that is not `127.0.0.1`, `localhost` or `[::1]`, or a `Sec-Fetch-Site` header other than `none`. The bundled MCP server, curl and scripts send none of these and are unaffected; a page that called the API from its own JavaScript on purpose is now refused. This matters on `integratedBrowserMcp.transport: "tcp"` and on the TCP fallback; the default unix socket was never reachable from a page. Context: [#26](https://github.com/thimo/vscode-integrated-browser-mcp/pull/26).
+
+### Fixed
+- **`~/.claude.json` could be replaced by a file holding only the bridge's own MCP entry.** On startup the extension reads that file, adds its entry and writes it back. Any read or parse failure was treated as "the file does not exist yet", so a file caught mid-write by Claude Code, or one with a trailing comma or a BOM, was overwritten and the user's projects and other MCP servers were gone. Only a missing file now starts fresh; in every other case the file is left untouched and the reason is logged. Context: [#25](https://github.com/thimo/vscode-integrated-browser-mcp/pull/25).
+- **A tab whose CDP session failed to start or closed stayed registered.** On the proposed-API path there is no reconnect, so such a tab kept the bridge from opening a new one and every call returned "CDP not connected" until the window was reloaded. The tab is now dropped, and a tab the bridge opened itself is closed when it cannot be driven.
+- **The fallback path could attach to the root debug session.** Only the child session carries the CDP proxy; attaching to a focused root launcher session spent about a minute on failing retries. The active session is now resolved to its child first.
+- **`browser_network` lost the status of redirect hops.** Chromium reuses one request id across a redirect chain, so only the last hop got a status, and once the first hop left the 200-entry buffer the last hop no longer recorded its response either. Every hop now reports its own status.
+- **A download announced under both `Page.*` and `Browser.*` appeared twice in `browser_downloads`**, with one copy stuck on `inProgress`.
+- **`browser_emulate` with `mobile: true` fell back to the deprecated `Page.*` override on pages without a viewport meta tag.** The check compared the requested width to `innerWidth`, which in mobile mode is the layout viewport (980 or more on such a page). It now reads the visual viewport.
+
+### Changed
+- **`browser_scroll` / `POST /scroll` with a `selector` that matches nothing now fails with `Element not found`** instead of answering `scrolled: true`, in line with `browser_click` and `browser_type`.
+
 ## [0.9.1] — 2026-10-16
 
 Contributed by [@tianlang0704](https://github.com/tianlang0704) (#24), including the Windows verification. Thanks!
