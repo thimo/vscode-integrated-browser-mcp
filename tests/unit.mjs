@@ -621,6 +621,77 @@ const section = name => console.log(`\n${name}`);
 	eq('names the two ways it frees up', leaseBusyError(0, 0).includes('frees up when that session ends or after 5 minutes idle'), true);
 }
 
+// ------------------------------------------------------------- claude-config
+{
+	section('readClaudeConfig — never treat an unreadable ~/.claude.json as empty');
+	const { readClaudeConfig } = await load('src/claude-config.ts');
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ibm-claude-config-'));
+	const file = name => path.join(dir, name);
+	try {
+		eq('a missing file starts fresh', await readClaudeConfig(file('missing.json')), {});
+
+		fs.writeFileSync(file('ok.json'), JSON.stringify({ projects: { a: 1 }, mcpServers: {} }));
+		eq('a valid file is returned as-is', await readClaudeConfig(file('ok.json')), { projects: { a: 1 }, mcpServers: {} });
+
+		// The failures that used to come back as {} and get written over the
+		// user's real config: Claude Code mid-write, hand-edited, or BOM'd.
+		fs.writeFileSync(file('partial.json'), '{"projects": {"a": 1');
+		eq('a truncated file is refused', await readClaudeConfig(file('partial.json')), null);
+		fs.writeFileSync(file('comma.json'), '{"projects": {},}');
+		eq('a trailing comma is refused', await readClaudeConfig(file('comma.json')), null);
+		fs.writeFileSync(file('bom.json'), '﻿{"projects": {}}');
+		eq('a BOM is refused', await readClaudeConfig(file('bom.json')), null);
+		fs.writeFileSync(file('array.json'), '[]');
+		eq('a non-object top level is refused', await readClaudeConfig(file('array.json')), null);
+		eq('a directory (EISDIR) is refused, not treated as missing', await readClaudeConfig(dir), null);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// ------------------------------------------------- cdp-tab: event buffering
+{
+	section('CDPTab buffers — redirects and duplicate download events');
+	const { CDPTab } = await load('src/cdp-tab.ts');
+	const newTab = () => new CDPTab('t', { appendLine() {} });
+	// handleEvent is private in TS only; driving it exercises the real routing.
+	const emit = (tab, method, params) => tab.handleEvent(method, params);
+	const request = (requestId, url, redirectResponse) => ({
+		requestId, type: 'Document', request: { method: 'GET', url },
+		...(redirectResponse ? { redirectResponse } : {}),
+	});
+
+	{
+		const tab = newTab();
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'http://x.com/'));
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'https://x.com/', { status: 301, statusText: 'Moved Permanently' }));
+		emit(tab, 'Network.responseReceived', { requestId: 'r1', response: { status: 200, statusText: 'OK' } });
+		eq('each redirect hop gets its own status', tab.network.map(e => [e.url, e.status]), [['http://x.com/', 301], ['https://x.com/', 200]]);
+	}
+
+	{
+		// The first hop is evicted while the second is still in flight: the
+		// eviction must not take the live hop's map slot with it.
+		const tab = newTab();
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'http://x.com/'));
+		for (let i = 0; i < 199; i++) emit(tab, 'Network.requestWillBeSent', request(`f${i}`, `https://x.com/f${i}`));
+		emit(tab, 'Network.requestWillBeSent', request('r1', 'https://x.com/', { status: 302, statusText: 'Found' }));
+		emit(tab, 'Network.responseReceived', { requestId: 'r1', response: { status: 200, statusText: 'OK' } });
+		eq('buffer stays capped', tab.network.length, 200);
+		eq('evicting an old hop keeps the live hop recording', tab.network.at(-1).status, 200);
+	}
+
+	{
+		const tab = newTab();
+		const begin = { guid: 'g1', url: 'https://x.com/a.zip', suggestedFilename: 'a.zip' };
+		emit(tab, 'Page.downloadWillBegin', begin);
+		emit(tab, 'Browser.downloadWillBegin', begin);
+		emit(tab, 'Browser.downloadProgress', { guid: 'g1', state: 'completed', totalBytes: 10, receivedBytes: 10 });
+		eq('Page.* + Browser.* announce one download once', tab.downloads.length, 1);
+		eq('the single entry receives progress', tab.downloads[0].state, 'completed');
+	}
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) {
 	console.log(`${failures} FAILED`);

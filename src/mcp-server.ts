@@ -610,7 +610,7 @@ server.tool(
 
 server.tool(
 	'browser_tab_list',
-	'List every tab under the bridge. Returns an array of { tabId, number, url, title, active, state, transport }. The `number` matches the "(N) " prefix shown in each tab title — if the user says "reload browser 2", find the entry with number=2 and use its tabId. A tab is numbered once you act on it, and keeps that number until it closes. `number` is null for a tab you have not acted on, and for the 21st tab onward (their titles show 🤯 instead of a number); refer to those by tabId or URL.',
+	'List every tab under the bridge. Returns an array of { tabId, number, url, title, active, state, transport }. The `number` matches the "(N) " prefix shown in each tab title — if the user says "reload browser 2", find the entry with number=2 and use its tabId. A tab is numbered once you act on it, and keeps that number until it closes. `number` is null for a tab you have not acted on; refer to those by tabId or URL.',
 	{},
 	async () => toMcpResult(await bridgeFetch('/tabs')),
 );

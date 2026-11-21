@@ -83,8 +83,17 @@ All responses: `{ ok: true, data: ... }` or `{ ok: false, error: "..." }`
 | POST | `/network/clear` | — | Clear network log |
 | GET  | `/url` | — | Current page URL |
 | GET  | `/tabs` | — | List open browser tabs |
-| POST | `/tabs/:id/activate` | — | Switch tab |
+| POST | `/tab/open` | `{ url, makeActive? }` | Open a new tab (proposed API only) |
+| POST | `/tab/close/:tabId` | — | Close a tab |
+| POST | `/tab/activate/:tabId` | — | Switch tab |
+| GET  | `/screenshot-slice` | `?slice=N` | Viewport-height slice + metadata |
+| GET  | `/markdown` | `?selector=S` | Page content as markdown |
+| POST | `/pixel` | `{ selector?, points? }` | Sample on-screen colours |
+| POST | `/download/set` | `{ path?, behavior? }` | Configure download handling |
+| GET  | `/downloads` | `?limit=N` | Buffered download events |
 | GET  | `/status` | — | Bridge health |
+
+Most endpoints also accept `tabId`; README.md has the full, authoritative table.
 
 ### MCP Server
 Wraps the HTTP API as MCP tools so Claude Code can use it natively without curl.
